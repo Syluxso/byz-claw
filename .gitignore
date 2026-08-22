@@ -1,0 +1,6 @@
+bin/
+*.exe
+*.db
+*.test
+.DS_Store
+testdata/home-demo/
