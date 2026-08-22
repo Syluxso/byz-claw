@@ -1,4 +1,4 @@
-# byz-claw — Grok Build Implementation Spec (v2)
+# byz-claw — Grok Build Implementation Spec (v3)
 
 Hand this entire file to local Grok Build. It is the source of truth.
 Prefer this over inventing structure, over OpenClaw clones, and over "EnterpriseClaw" MVC demos.
@@ -22,8 +22,13 @@ Prefer this over inventing structure, over OpenClaw clones, and over "Enterprise
 | Enterprise v1 | Policy, audit, secrets, doctor, allowlists — not SSO mothership / Vault / CRDs. |
 | Size honesty | Core target ≤ ~35MB binary, idle tens of MB RAM. Do **not** claim 7–10MB. |
 | Build | `CGO_ENABLED=0` `-ldflags="-s -w"`. No UPX. Prefer `modernc.org/sqlite` (no CGO). |
+| **Tasks vs inbox** | **Tasks** = durable completion contracts. **Inbox** = short session pending buffer. Never call the buffer a "queue" in product docs (avoids Kafka/Rabbit confusion). |
+| **Task truth** | Status in SQLite is the only completion truth. The model does not "vibe complete." |
+| **Approval** | Agent-owned work that requires human gate uses policy: block parent + open `owner=user` approval task — not a separate subsystem. |
 
 **Rule:** *The loop is not a plugin. The loop has plugins (middleware/hooks).*
+
+**Rule:** *Inbox feeds the loop. Tasks annotate what "finished" means across time. Neither replaces `Loop.Handle`.*
 
 ---
 
@@ -35,6 +40,8 @@ Prefer this over inventing structure, over OpenClaw clones, and over "Enterprise
 - Safe defaults: shell off, path jail, SSRF block, secrets redacted, localhost webhook
 - Skills as `SKILL.md`; optional `SOUL.md` `MEMORY.md` `HEARTBEAT.md`
 - `doctor` tells the truth before you trust the process
+- Durable **tasks** (user / agent / process commitments) and **inbox** (pending inbound while a run is busy)
+- Simple day-one; same ports scale to long-running and enterprise adapters later
 
 ### Non-goals v1
 - Skill marketplace / ClawHub
@@ -45,6 +52,20 @@ Prefer this over inventing structure, over OpenClaw clones, and over "Enterprise
 - User-written `Agent.Execute()` controllers
 - Feature parity with OpenClaw
 - Wasm / gVisor / Firecracker (sandbox **port** may exist as `none`; real isolation later)
+- Camunda / full DAG workflow engine / Jira clone
+- Multi-agent swarm product
+- OpenClaw-style `/queue` steer|followup|collect|interrupt mode matrix as a user feature
+- Email channel (later: adapter into inbox or tasks, not "agent is Gmail")
+
+### What we deliberately fix vs OpenClaw (complaints → byz-claw)
+
+| OpenClaw pain | byz-claw stance |
+|---|---|
+| Gateway RAM / OOM | Go binary; SQLite; compaction deletes rows; no unbounded session skill snapshots in heap |
+| Shell / skills / exposed gateway | Shell off; workspace jail; localhost webhook; Telegram `allow_from`; no ClawHub |
+| Broken memory backends | Durable SQLite + task rows; inject **small** open-task JSON, not MEMORY.md novels |
+| Install / Node upgrade hell | One static binary; onboard/doctor |
+| Unclear heartbeat vs cron vs "tasks" | Heartbeat = wake; **tasks** = commitments; **inbox** = pending inbound |
 
 ---
 
@@ -55,84 +76,42 @@ Coding agents retrieve patterns better when names match training data:
 1. **12-factor daemon** — one process, config file + env, logs stdout
 2. **Standard Go layout** — `cmd/` `internal/`
 3. **Clean / hexagonal** — `core` imports only `ports` + stdlib
-4. **CLI subcommands** — `onboard` `gateway` `doctor` `version` (cobra optional)
+4. **CLI subcommands** — `onboard` `gateway` `doctor` `version` `run` `task` (cobra optional)
 5. **Laravel/Spring middleware** — **named hook points on a fixed kernel**, not an onion around a custom Execute
 6. **Compile-time wiring** — `main` registers tools, channels, middleware explicitly
 
-Do **not** scan `app/Agents/*.go` to auto-register. That is reflection or codegen. Skills on disk are the dynamic extension.
+Do **not** scan `app/Agents/*.go` to auto-register. That is reflection or codegen. Skills on disk are the dynamic extension. Tasks/inbox are **ports + SQLite**, not a second runtime.
 
 ---
 
-## 3. Repository layout (create exactly this)
+## 3. Repository layout
 
 ```
 byzclaw/
   README.md
   BYZCLAW_BUILD_PLAN.md
-  go.mod                     # github.com/Syluxso/byzclaw (or user module)
+  go.mod
   Makefile
   cmd/
-    byzclaw/
-      main.go
-    byzclaw-full/
-      main.go
+    byzclaw/main.go
+    byzclaw-full/main.go
   internal/
     core/
-      loop.go
-      run.go
-      policy.go
-      compact.go
-      heartbeat.go
-      skills.go
-      workspace_files.go
-      hooks.go
-      types.go
+      loop.go, run.go, policy.go, compact.go, heartbeat.go
+      skills.go, workspace_files.go, hooks.go, tasks.go, inbox.go, types.go
     ports/
-      channel.go
-      tool.go
-      model.go
-      store.go
-      memory.go
-      secrets.go
-      sandbox.go
-      clock.go
-      hooks.go
+      channel.go, tool.go, model.go, store.go, task.go, inbox.go
+      memory.go, secrets.go, sandbox.go, clock.go, hooks.go
     adapters/
-      channel/
-        cli/
-        telegram/
-        webhook/
-      model/
-        openai_compat.go
-      tool/
-        workspace.go
-        http_fetch.go
-        memory_tool.go
-        shell.go
-      store/
-        sqlite.go
-      memory/
-        markdown.go
-      secrets/
-        file_secrets.go
-      sandbox/
-        none.go
-      hooks/
-        audit.go
-        pii.go
-        token_ceiling.go
-  config/
-    config.go
-    load.go
-  log/
-    log.go
-  skills/
-    example-note/
-      SKILL.md
-  testdata/
-    runs/
-  docs/
-    DESIGN.md
+      channel/{cli,telegram,webhook}/
+      model/{openai_compat.go,local_demo.go}
+      tool/{workspace,http_fetch,memory_tool,shell,task_tools}.go
+      store/sqlite.go
+      memory/markdown.go
+      secrets/file_secrets.go
+      sandbox/none.go
+      hooks/{audit,pii,token_ceiling,task_approval}.go
+  config/, log/, skills/example-note/SKILL.md, testdata/runs/, docs/DESIGN.md
 ```
 
 ---
@@ -141,476 +120,272 @@ byzclaw/
 
 Define first. Core never imports Telegram, SQLite, YAML adapters, etc.
 
+Same Channel / Tool / Store / Model / Hook ports as v2, **plus**:
+
+### TaskStore (durable completion contracts)
+
 ```go
-package ports
+type TaskOwner string  // agent | user | run | process | system
+type TaskStatus string // open | blocked | done | cancelled
 
-type Inbound struct {
-    Channel   string
-    SessionID string
-    UserID    string
-    Text      string
-    Kind      string // "user" | "heartbeat" | "system"
-    Meta      map[string]string
+type Task struct {
+    ID, Title, BodyRef string
+    Owner         TaskOwner
+    Kind          string // goal | step | procedure | approval
+    Status        TaskStatus
+    BlockedReason string
+    Source        string
+    SessionID, RunID, ParentID, BlocksTaskID string
+    DoneWhen      string
+    RequiresApproval bool
+    DedupeKey     string
+    Metadata      json.RawMessage
+    CreatedAt, UpdatedAt time.Time
+    CompletedAt   *time.Time
 }
 
-type Outbound struct {
-    Channel   string
-    SessionID string
-    Text      string
-    Meta      map[string]string
-}
-
-type Channel interface {
-    Name() string
-    Start(ctx context.Context, inbox chan<- Inbound) error
-    Send(ctx context.Context, msg Outbound) error
-}
-
-type ToolCall struct {
-    ID   string
-    Name string
-    Args json.RawMessage
-}
-
-type ToolResult struct {
-    ID      string
-    Name    string
-    Content string
-    IsError bool
-}
-
-type ToolSpec struct {
-    Name        string
-    Description string
-    Schema      json.RawMessage
-}
-
-type Tool interface {
-    Name() string
-    Description() string
-    Schema() json.RawMessage
-    Exec(ctx context.Context, call ToolCall) (ToolResult, error)
-}
-
-type Message struct {
-    ID         string
-    SessionID  string
-    Role       string // user | assistant | tool | system
-    Content    string
-    ToolCalls  []ToolCall // assistant
-    ToolCallID string     // tool
-    CreatedAt  time.Time
-}
-
-type RunStatus string // accepted | model | tool_pending | tool_done | completed | failed | cancelled
-
-type Run struct {
-    ID        string
-    SessionID string
-    Status    RunStatus
-    Iteration int
-    Error     string
-    UpdatedAt time.Time
-}
-
-type Store interface {
-    SaveMessage(ctx context.Context, m Message) error
-    ListMessages(ctx context.Context, sessionID string, limit int) ([]Message, error)
-    SaveRun(ctx context.Context, r Run) error
-    LoadRun(ctx context.Context, id string) (Run, error)
-    ListIncompleteRuns(ctx context.Context) ([]Run, error)
-}
-
-type CompletionRequest struct {
-    Messages []Message
-    Tools    []ToolSpec
-    Model    string
-}
-
-type CompletionResponse struct {
-    Content   string
-    ToolCalls []ToolCall
-    Usage     TokenUsage
-}
-
-type TokenUsage struct {
-    Input  int
-    Output int
-}
-
-type Model interface {
-    Complete(ctx context.Context, req CompletionRequest) (CompletionResponse, error)
-}
-
-type Policy interface {
-    AllowTool(ctx context.Context, name string, args json.RawMessage) error
-    AllowPath(path string, op string) error // read | write | list
-}
-
-type Skill struct {
-    ID    string
-    Name  string
-    Body  string
-    Tools []string
-}
-
-type SkillSource interface {
-    List(ctx context.Context) ([]Skill, error)
-    Get(ctx context.Context, id string) (Skill, error)
-}
-
-type Secrets interface {
-    Get(ctx context.Context, name string) (string, error)
-}
-
-type HookPoint string
-
-const (
-    HookOnInbound   HookPoint = "on_inbound"
-    HookBeforeModel HookPoint = "before_model"
-    HookAfterModel  HookPoint = "after_model"
-    HookBeforeTool  HookPoint = "before_tool"
-    HookAfterTool   HookPoint = "after_tool"
-    HookOnLimit     HookPoint = "on_limit"
-    HookOnError     HookPoint = "on_error"
-    HookOnComplete  HookPoint = "on_complete"
-)
-
-type HookContext struct {
-    Run      *Run
-    Session  string
-    Inbound  *Inbound
-    Notes    []string
-    ToolName string
-    ToolArgs json.RawMessage
-}
-
-type VetoError struct{ Reason string }
-
-func (e VetoError) Error() string { return e.Reason }
-
-type Hook interface {
-    Point() HookPoint
-    Name() string
-    Run(ctx context.Context, hc *HookContext) error
+type TaskStore interface {
+    Create(ctx context.Context, t Task) (Task, error)
+    Get(ctx context.Context, id string) (Task, error)
+    List(ctx context.Context, f TaskFilter) ([]Task, error)
+    ListOpen(ctx context.Context, owner TaskOwner, limit int) ([]Task, error)
+    UpdateStatus(ctx context.Context, id string, status TaskStatus, reason string) error
+    Complete(ctx context.Context, id string) error
+    Block(ctx context.Context, id string, reason string) error
+    Cancel(ctx context.Context, id string, reason string) error
 }
 ```
 
-Tool DX: structs with json tags; helper generates JSON Schema. Do not return schema as an untyped string.
-Do not add Agent / Blueprint / Execute. The kernel is the agent.
+### InboxStore (session pending buffer — not a "queue")
+
+```go
+type InboxState string // pending | delivered | dropped
+
+type InboxItem struct {
+    ID, SessionID, Channel, ExternalID string
+    Payload        json.RawMessage
+    State          InboxState
+    ArrivedAt      time.Time
+    DeliveredRunID string
+    Attempts       int
+    LastError      string
+}
+
+type InboxStore interface {
+    Enqueue(ctx context.Context, item InboxItem) (InboxItem, error)
+    ListPending(ctx context.Context, sessionID string, limit int) ([]InboxItem, error)
+    MarkDelivered(ctx context.Context, id string, runID string) error
+    Drop(ctx context.Context, id string, reason string) error
+}
+```
+
+### Extra hook points
+
+`on_task_created`, `before_task_complete`, `on_task_blocked`, `on_task_cancelled`,
+`on_inbound_buffered`, `on_inbox_drained`
+
+Tool DX: structs + JSON Schema. No Agent/Blueprint/Execute.
 
 ---
 
 ## 5. Agent loop (non-negotiable)
 
 ```
-inbound
-  → middleware on_inbound
-  → authorize (channel allowlist)
-  → load session + SOUL.md + skills → system prompt
-  → compact if over threshold
-  → middleware before_model
-  → model.Complete
-  → middleware after_model
-  → persist assistant message (including tool_calls) BEFORE any tool
-  → for each tool_call:
-        middleware before_tool
-        policy.AllowTool
-        tool.Exec
-        middleware after_tool
-        persist tool result BEFORE next model call
-  → if tool_calls present → iteration++ → model again
-  → else Send outbound
-  → middleware on_complete
+inbound (or drained inbox item)
+  → on_inbound → authorize
+  → session + SOUL + skills
+  → inject ListOpen tasks (tiny JSON: id, owner, title, status, done_when)
+  → compact → before_model → model → after_model
+  → persist assistant (tool_calls) BEFORE tools
+  → each tool: before_tool → policy → Exec → after_tool → persist result
+  → iterate or outbound → on_complete
+  → reconcile owner=run tasks
+  → if idle: Inbox.Drain → next Handle
 ```
 
 **Hard rules**
 
 - Never send the model an assistant `tool_calls` message without matching tool results in store.
-- `max_tool_iterations` default 12. On limit: user-visible text, `on_limit`, stop. No silent spin.
-- Same tool + same error 3 times → abort that path with explanation.
-- On gateway start: `ListIncompleteRuns`. Resume if safe else mark failed.
-- Heartbeat = `Inbound{Kind: "heartbeat"}` plus `HEARTBEAT.md` into the same loop.
-- Profiles are knob presets: `interactive` (default), `heartbeat`.
+- `max_tool_iterations` default 12. On limit: user-visible text, `on_limit`, stop.
+- Same tool + same error 3 times → abort that path.
+- On gateway start: `ListIncompleteRuns`. Resume if safe else mark failed. Then drain pending inbox.
+- Heartbeat = `Inbound{Kind: "heartbeat"}` + `HEARTBEAT.md`; may list open tasks, not invent completion.
+- While a session has an active run, new inbound → **Inbox.Enqueue** (`pending`), not a parallel Handle.
 
-**Compaction**
+**Compaction:** defaults threshold 8000, tail 10; must **delete** compacted rows from SQLite.
 
-Defaults: `compact_token_threshold: 8000`, `compact_tail_messages: 10`.
+**Middleware:** audit, pii, token_ceiling; optional `task_approval` on `before_task_complete`.
 
-**Middleware (built-ins)**
+---
 
-| Name | Points | Behavior |
+## 5b. Tasks system
+
+| | **Inbox** | **Tasks** |
 |---|---|---|
-| audit | before_tool, after_tool, on_error, on_complete | JSON lines: run id, tool, allow/deny, duration |
-| pii | before_model | Conservative regex redaction before the model |
-| token_ceiling | after_model, on_complete | Fail loud if over config cap |
+| Job | Buffer inbound while run busy | Work not finished until explicit end state |
+| Lifetime | Short | Long (across runs / heartbeats / restarts) |
+| Success | Handed to a run | Contract done or cancelled |
+| Name | inbox / pending | tasks |
 
-Hooks may veto (`VetoError`) and append `Notes`. Must not skip persistence or nest another loop.
+**Owners:** `user` | `agent` | `run` | `process` | `system`  
+**Status:** `open` → `blocked` → `done` | `cancelled`
+
+### Agent-owned, user-approved (policy)
+
+```
+Given a task needs human approval and is agent-owned (RequiresApproval)
+When the agent attempts complete
+Then parent → blocked (awaiting_approval)
+And a owner=user approval task is created (linked via ParentID / BlocksTaskID)
+And on user complete → parent unblocked/completed (reject → cancel parent)
+```
+
+Default: agent may **not** complete `owner=user` tasks.
+
+Procedures: same table + `parent_id` (flat first is OK). No DAG engine in v1.
+
+**Tools:** `task_create`, `task_list`, `task_get`, `task_complete`, `task_block`  
+**CLI:** `byzclaw task list|show|complete`
+
+**Fault tolerance:** persist before model sees task; `dedupe_key`; reconcile `owner=run` on gateway start.
+
+**Scale:** same `TaskStore` port; swap backend later; enterprise = adapters + hooks.
+
+---
+
+## 5c. Inbox (session pending)
+
+- Run idle → Handle immediately
+- Run active → Enqueue pending (external_id dedupe)
+- On complete / idle → drain FIFO
+- Cap + drop policy in config
+- Product name **inbox**, state **pending** — never public "queue"
 
 ---
 
 ## 6. Home directory
 
-`$BYZCLAW_HOME` default `~/.byzclaw` (`--home`, `BYZCLAW_HOME`).
+`$BYZCLAW_HOME` default `~/.byzclaw`.
 
 ```
 $BYZCLAW_HOME/
-  config.yaml
-  secrets/
-  workspace/
-  skills/
-  memory/
-  data/byzclaw.db
-  SOUL.md
-  MEMORY.md
-  HEARTBEAT.md
+  config.yaml, secrets/, workspace/, skills/, memory/
+  data/byzclaw.db    # messages, runs, tasks, inbox
+  data/audit.jsonl
+  SOUL.md, MEMORY.md, HEARTBEAT.md
 ```
 
-`SOUL.md` — persona in system prompt.
-`MEMORY.md` — long-term notes.
-`HEARTBEAT.md` — heartbeat-only instructions.
-
-`skills/<id>/SKILL.md`:
-
-```markdown
----
-id: daily-note
-name: Daily note
-tools: [workspace_read, workspace_write, memory_write]
----
-When the user asks to jot a note, write markdown under workspace/notes/...
-```
-
-Effective tools = skill allowlist ∩ enabled tools ∩ policy.
-No multi-agent in v1.
+Effective tools = skill allowlist ∩ enabled tools ∩ policy. No multi-agent in v1.
 
 ---
 
-## 7. Config (config.yaml)
+## 7. Config (additions)
 
 ```yaml
-model:
-  provider: openai_compat
-  base_url: https://api.x.ai/v1
-  model: grok-4
-  api_key_secret: xai
-
-channels:
-  cli:
-    enabled: true
-  telegram:
-    enabled: false
-    token_secret: telegram_bot
-    allow_from: []
-  webhook:
-    enabled: false
-    addr: "127.0.0.1:8743"
-    path: /hook
-    allow_public: false
-
 tools:
-  workspace:
-    root: workspace
-  http_fetch:
-    max_bytes: 2000000
-    timeout_seconds: 30
-  shell:
-    enabled: false
+  tasks:
+    enabled: true
 
-loop:
-  max_tool_iterations: 12
-  compact_token_threshold: 8000
-  compact_tail_messages: 10
-  profile: interactive
-  token_ceiling: 0
+inbox:
+  max_pending_per_session: 20
+  drop: oldest   # oldest | refuse
 
-heartbeat:
-  enabled: false
-  interval: 1h
-  quiet_hours:
-    start: "23:00"
-    end: "07:00"
-    timezone: Local
-  model: ""
-
-middleware:
-  - audit
-  - pii
-  - token_ceiling
-
-skills:
-  dir: skills
+tasks:
+  inject_open_limit: 20
+  run_end_policy: block   # block | cancel for owner=run leftovers
+  default_requires_approval: false
 ```
 
-Secrets: `$HOME/secrets/<name>` mode 0600. Never log values.
+(Other sections unchanged from v2: model, channels, loop, heartbeat, middleware, skills.)
 
 ---
 
 ## 8. Tools (core v1)
 
-| Name | Default | Rules |
-|---|---|---|
-| workspace_list | on | under workspace root |
-| workspace_read | on | EvalSymlinks + path stays in root |
-| workspace_write | on | same jail |
-| http_fetch | on | block private, loopback, link-local, metadata IPs |
-| memory_read / memory_write | on | under memory/ |
-| shell | off | only if enabled |
-
-No browser in core.
+workspace_list/read/write, http_fetch, memory_read/write, task_* (when enabled), shell **off** by default. No browser in core.
 
 ---
 
-## 9. Channels v1
+## 9–12. Channels, CLI, core/full, model
 
-- **CLI** — REPL and/or `byzclaw run --text "..."`
-- **Telegram** — require `allow_from` non-empty when enabled
-- **Webhook** — `POST {"session_id","text","user_id?"}; no 0.0.0.0 unless allow_public: true`
-
-Session keys: `cli:local`, `telegram:<chat_id>`, `webhook:<session_id>`.
-
----
-
-## 10. CLI
-
-```
-byzclaw onboard
-byzclaw gateway
-byzclaw doctor
-byzclaw version
-byzclaw run --text "..."
-```
-
-Doctor: config parse, secrets 0600, sqlite writable, workspace, telegram allowlist, webhook bind, shell-off check, model secret, MEMORY/SOUL size warn.
-Onboard creates dirs, writes config, prompts keys, runs doctor. Gateway doctors at start; abort on critical.
-
----
-
-## 11. Core vs full
-
-Same `internal/core`. Full only registers extra adapters later (UI, browser). One config schema.
-
----
-
-## 12. Model adapter
-
-One `openai_compat` client: chat completions + tools. xAI / OpenAI / Ollama-compatible.
+As v2, plus busy session → inbox; CLI adds `byzclaw task …`; LocalDemo when no API key.
 
 ---
 
 ## 13. Wiring
 
 ```
-parse flags → load config → secrets/store/policy → register tools/channels/middleware
-→ Loop → doctor → channels/heartbeat/webhook → Handle inbox
-→ recover incomplete runs → SIGINT
+parse flags → load config → secrets/store/taskstore/inboxstore/policy
+→ register tools/channels/middleware
+→ Loop → doctor → channels/heartbeat/webhook
+→ inbound: busy? enqueue : Handle
+→ recover incomplete runs → drain pending → SIGINT
 ```
 
 ---
 
 ## 14. Tests (required)
 
-- Path jail: `..`, symlink out, root boundary
-- Crash after assistant `tool_calls`, before tool result → restart safe
-- Max iterations stops
-- SSRF: 169.254.169.254, 127.0.0.1, 10.0.0.1
-- Golden fixture tool round-trip with fake model
-- PII middleware unit test
+Path jail, crash resume, max iterations, SSRF, golden tool round-trip, PII,
+**tasks** (create/list/complete; agent cannot complete owner=user; requires_approval flow),
+**inbox** (enqueue while busy; drain; dedupe; no double-deliver after restart),
+**run end** (owner=run policy).
 
 ---
 
 ## 15. Makefile
 
-```makefile
-BINARY_NAME=byzclaw
-BUILD_FLAGS=-ldflags="-s -w" -trimpath
-
-.PHONY: build test vet
-
-build:
-	CGO_ENABLED=0 go build $(BUILD_FLAGS) -o bin/$(BINARY_NAME) ./cmd/byzclaw
-
-test:
-	go test ./...
-
-vet:
-	go vet ./...
-```
-
-No UPX. Prefer `modernc.org/sqlite`.
+Unchanged: `CGO_ENABLED=0`, `-ldflags="-s -w"`, no UPX, modernc sqlite.
 
 ---
 
 ## 16. Implementation order
 
-1. Module + layout + ports + types
-2. SQLite store + policy path jail + tests
-3. Fake model + core/loop + workspace tools + loop tests
-4. Config + secrets + CLI + doctor + onboard
-5. `openai_compat` + `run --text` / CLI REPL
-6. Telegram + webhook
-7. Skills + SOUL/MEMORY/HEARTBEAT + compaction
-8. Heartbeat ticker + audit/pii/token_ceiling
-9. Incomplete run recovery
-10. README
+**Done (do not regress):** loop, jail, tools, onboard/doctor/run, skills, compaction,
+middleware, gateway, webhook, Telegram, heartbeat, audit.
 
-Do not start Discord, browser, UI chrome, MCP, vector DB, or gRPC.
+**Next:** tasks + inbox tables/ports → gateway buffer/drain → task tools/CLI →
+inject open tasks → run-end reconcile → optional approval hook → tests → README naming.
+
+**Later:** Discord, browser, full UI, MCP, email, external TaskStore.
 
 ---
 
-## 17. Demo bar ("done")
+## 17. Demo bar
 
 ```
 make build && ./bin/byzclaw onboard
 ./bin/byzclaw run --text "write hello to workspace/hi.md"
 ```
 
-- File exists under workspace jail
-- Kill -9 gateway; restart; no `tool_call_id` corruption
-- doctor passes with telegram off and shell off
+Plus when tasks/inbox land: create user task, `byzclaw task list`, second message while busy drains after.
 
 ---
 
 ## 18. Anti-patterns
 
-- `core` importing adapters
-- String-prefix path checks without `EvalSymlinks`
-- Shell or public bind on by default
-- `Agent` interface with user `Execute`
-- Onion middleware wrapping a custom agent
-- Schema as free-form strings only
-- Claiming sub-10MB / 8MB idle
-- UPX, CGO sqlite, Node, Gin
-- Scanning Go packages to register tools
-- Nested LLM loops in hooks
-- Control plane, Vault, K8s CRDs, Wasm in v1
-- Unbounded history to the model
+Prior list, plus:
+- Calling the session pending buffer a "queue" in user-facing docs
+- Storing todos only in HEARTBEAT.md / MEMORY.md
+- Second registered agent engine / pluggable Loop.Handle
+- Approval as a separate database or workflow product
+- Merging inbox notifications with task completion state
 
 ---
 
-## 19. README skeleton
+## 19–20. README / not from EnterpriseClaw
 
-```
-byz-claw — OpenClaw's idea. Pico-class install. Defaults that will not burn the host.
-
-One static Go binary
-Text it on CLI or Telegram
-Skills are markdown; tools are reviewed Go
-Shell off; workspace jail; doctor included
-```
-
-Headline: one loop, one layout, safe defaults. Not "Laravel of agents."
+Unchanged intent. Later enterprise = adapters on this same core.
 
 ---
 
-## 20. Not from the EnterpriseClaw/Gemini draft
+## 21. Design origins
 
-Do not implement: split control plane, `internal/app/agents` MVC, Kernel `BuildPipeline` around `Execute`, required Vault/Bedrock, gVisor/Firecracker/wazero v1, UPX, CRDs, stub `Execute` as the product.
-
-Later enterprise = adapters on this same core.
+- **Gears:** SQLite for queryable facts; avoid stuffing the model with large files
+- **OpenClaw:** durability lessons; do not copy RAM/skill-hub/security defaults
+- **PicoClaw:** small binary; HEARTBEAT.md as standing orders only
+- **byz-claw:** fixed loop + hooks; tasks = completion contracts; inbox = pending
 
 ---
 
-*End of spec. Implement strictly. When ambiguous, choose the stricter security interpretation.*
-
-Save as `BYZCLAW_BUILD_PLAN.md` and hand that file to local Grok Build.
+*End of spec v3. Implement strictly. When ambiguous, choose the stricter security interpretation.*
