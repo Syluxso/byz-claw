@@ -20,8 +20,8 @@ func roughTokens(msgs []ports.Message) int {
 	return n
 }
 
-// CompactIfNeeded summarizes older history when over threshold.
-// Uses a single Model.Complete call (not a nested agent loop).
+// CompactIfNeeded summarizes older history when over threshold, persists the summary,
+// and deletes compacted message rows from the store.
 func (l *Loop) CompactIfNeeded(ctx context.Context, sessionID string, msgs []ports.Message) ([]ports.Message, error) {
 	th := l.Config.CompactTokenThreshold
 	tail := l.Config.CompactTailMessages
@@ -41,7 +41,11 @@ func (l *Loop) CompactIfNeeded(ctx context.Context, sessionID string, msgs []por
 	keep := msgs[len(msgs)-tail:]
 
 	var transcript strings.Builder
+	dropIDs := make([]string, 0, len(head))
 	for _, m := range head {
+		if m.ID != "" {
+			dropIDs = append(dropIDs, m.ID)
+		}
 		transcript.WriteString(m.Role)
 		transcript.WriteString(": ")
 		transcript.WriteString(m.Content)
@@ -58,7 +62,6 @@ func (l *Loop) CompactIfNeeded(ctx context.Context, sessionID string, msgs []por
 	}
 	resp, err := l.Model.Complete(ctx, summaryReq)
 	if err != nil {
-		// Compaction failure must not break the run — keep full history.
 		return msgs, nil
 	}
 	summary := strings.TrimSpace(resp.Content)
@@ -72,14 +75,15 @@ func (l *Loop) CompactIfNeeded(ctx context.Context, sessionID string, msgs []por
 		Content:   "Conversation summary (compacted):\n" + summary,
 		CreatedAt: l.Clock.Now(),
 	}
-	// Persist summary and drop compacted messages from store by rewriting session? 
-	// Simpler: return in-memory compacted view for this Complete only; also save summary for future.
-	_ = l.Store.SaveMessage(ctx, sumMsg)
+	if err := l.Store.SaveMessage(ctx, sumMsg); err != nil {
+		return msgs, nil
+	}
+	if err := l.Store.DeleteMessages(ctx, sessionID, dropIDs); err != nil {
+		// Summary is saved; keep returning compacted view even if delete fails.
+		_ = fmt.Errorf("compact delete: %w", err)
+	}
 	out := make([]ports.Message, 0, 1+len(keep))
 	out = append(out, sumMsg)
 	out = append(out, keep...)
 	return out, nil
 }
-
-// Format for tests.
-func compactDebug(n int) string { return fmt.Sprintf("tokens~%d", n) }

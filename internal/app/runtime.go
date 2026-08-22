@@ -18,6 +18,10 @@ import (
 	"github.com/Syluxso/byzclaw/internal/ports"
 )
 
+// Verbose enables stderr audit lines (BYZCLAW_VERBOSE=1 or --verbose).
+var Verbose bool
+
+
 type Runtime struct {
 	Home   home.Paths
 	Config config.Config
@@ -63,6 +67,9 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 	allTools = append(allTools, (&tooladapter.Workspace{Policy: wsPolicy}).Tools()...)
 	allTools = append(allTools, (&tooladapter.MemoryTools{Policy: memPolicy}).Tools()...)
 	allTools = append(allTools, tooladapter.NewHTTPFetch(cfg.Tools.HTTPFetch.MaxBytes, cfg.Tools.HTTPFetch.TimeoutSeconds))
+	if cfg.Tools.Shell.Enabled {
+		allTools = append(allTools, &tooladapter.Shell{Policy: wsPolicy})
+	}
 
 	skillsDir := cfg.Skills.Dir
 	if !filepath.IsAbs(skillsDir) {
@@ -81,6 +88,14 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 		toolMap[t.Name()] = t
 	}
 	toolMap = core.FilterToolsBySkills(toolMap, skills)
+	// Shell is opt-in via config; keep it even if skills omit it.
+	if cfg.Tools.Shell.Enabled {
+		for _, t := range allTools {
+			if t.Name() == "shell" {
+				toolMap["shell"] = t
+			}
+		}
+	}
 	tools := make([]ports.Tool, 0, len(toolMap))
 	for _, t := range toolMap {
 		tools = append(tools, t)
@@ -122,8 +137,20 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 	loop := core.NewLoop(st, mdl, tools, wsPolicy, loopCfg)
 	loop.SystemPrompt = buildSystemPrompt(p, skills)
 	loop.Hooks = buildHooks(cfg)
+	configureAudit(p, Verbose || strings.EqualFold(os.Getenv("BYZCLAW_VERBOSE"), "1") || os.Getenv("BYZCLAW_VERBOSE") == "true")
 
 	return &Runtime{Home: p, Config: cfg, Store: st, Loop: loop, Model: mdl, Skills: skills}, nil
+}
+
+func configureAudit(p home.Paths, verbose bool) {
+	path := filepath.Join(p.Data, "audit.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		hooks.ConfigureAudit(nil, verbose)
+		return
+	}
+	// File handle lives for process lifetime; intentional for daemon.
+	hooks.ConfigureAudit(f, verbose)
 }
 
 func (r *Runtime) Close() error {

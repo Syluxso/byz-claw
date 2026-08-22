@@ -89,6 +89,28 @@ ON CONFLICT(id) DO UPDATE SET
 	return err
 }
 
+func (s *SQLite) DeleteMessages(ctx context.Context, sessionID string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, `DELETE FROM messages WHERE session_id = ? AND id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, id := range ids {
+		if _, err := stmt.ExecContext(ctx, sessionID, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *SQLite) ListMessages(ctx context.Context, sessionID string, limit int) ([]ports.Message, error) {
 	if limit <= 0 {
 		limit = 200

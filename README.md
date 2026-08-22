@@ -16,7 +16,11 @@ make build
 ./bin/byzclaw doctor
 ./bin/byzclaw gateway          # CLI REPL (+ recover incomplete runs)
 ./bin/byzclaw gateway --webhook  # also listen on webhook (see config)
+./bin/byzclaw run --text "..." --verbose  # audit JSON on stderr too
 ```
+
+Audit lines append to `$BYZCLAW_HOME/data/audit.jsonl` (quiet CLI by default).  
+Shell tool exists but stays **off** unless `tools.shell.enabled: true`.
 
 Override home: `--home DIR` or `BYZCLAW_HOME`.
 

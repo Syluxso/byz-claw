@@ -55,11 +55,13 @@ func main() {
 		homeFlag := fs.String("home", "", "BYZCLAW_HOME")
 		text := fs.String("text", "", "user message")
 		session := fs.String("session", "cli:local", "session id")
+		verbose := fs.Bool("verbose", false, "echo audit JSON to stderr")
 		_ = fs.Parse(args)
 		if strings.TrimSpace(*text) == "" {
 			fmt.Fprintln(os.Stderr, "run: --text is required")
 			os.Exit(2)
 		}
+		app.Verbose = *verbose
 		root, err := home.Resolve(*homeFlag)
 		must(err)
 		rt, err := app.OpenRuntime(root)
@@ -81,7 +83,9 @@ func main() {
 		noCLI := fs.Bool("no-cli", false, "disable stdin REPL")
 		webhook := fs.Bool("webhook", false, "force-enable webhook channel")
 		telegram := fs.Bool("telegram", false, "force-enable telegram channel")
+		verbose := fs.Bool("verbose", false, "echo audit JSON to stderr")
 		_ = fs.Parse(args)
+		app.Verbose = *verbose
 		root, err := home.Resolve(*homeFlag)
 		must(err)
 		must(app.RunGateway(root, app.GatewayOptions{

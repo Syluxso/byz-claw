@@ -88,6 +88,7 @@ type Run struct {
 type Store interface {
 	SaveMessage(ctx context.Context, m Message) error
 	ListMessages(ctx context.Context, sessionID string, limit int) ([]Message, error)
+	DeleteMessages(ctx context.Context, sessionID string, ids []string) error
 	SaveRun(ctx context.Context, r Run) error
 	LoadRun(ctx context.Context, id string) (Run, error)
 	ListIncompleteRuns(ctx context.Context) ([]Run, error)

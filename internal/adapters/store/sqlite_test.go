@@ -35,6 +35,27 @@ func TestSaveAndListMessages(t *testing.T) {
 	}
 }
 
+func TestDeleteMessages(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	_ = s.SaveMessage(ctx, ports.Message{ID: "a", SessionID: "s", Role: "user", Content: "1", CreatedAt: time.Now().UTC()})
+	_ = s.SaveMessage(ctx, ports.Message{ID: "b", SessionID: "s", Role: "user", Content: "2", CreatedAt: time.Now().UTC()})
+	if err := s.DeleteMessages(ctx, "s", []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListMessages(ctx, "s", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ID != "b" {
+		t.Fatalf("%+v", list)
+	}
+}
+
 func TestIncompleteRuns(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
