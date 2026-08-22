@@ -87,8 +87,19 @@ func Doctor(homeRoot string) ([]DoctorFinding, error) {
 
 	if cfg.Channels.Webhook.Enabled {
 		addr := cfg.Channels.Webhook.Addr
-		if strings.HasPrefix(addr, "0.0.0.0") && !cfg.Channels.Webhook.AllowPublic {
-			out = append(out, DoctorFinding{"critical", "webhook", "public bind without allow_public"})
+		if (strings.HasPrefix(addr, "0.0.0.0") || strings.HasPrefix(addr, ":") || addr == "") && !cfg.Channels.Webhook.AllowPublic {
+			if strings.HasPrefix(addr, "0.0.0.0") || strings.HasPrefix(addr, ":") {
+				out = append(out, DoctorFinding{"critical", "webhook", "public bind without allow_public"})
+			} else {
+				out = append(out, DoctorFinding{"ok", "webhook", addr})
+			}
+		} else if cfg.Channels.Webhook.AllowPublic {
+			tok := filepath.Join(p.Secrets, "webhook_token")
+			if _, err := os.Stat(tok); err != nil {
+				out = append(out, DoctorFinding{"critical", "webhook", "allow_public requires secrets/webhook_token"})
+			} else {
+				out = append(out, DoctorFinding{"ok", "webhook", addr+" (public+token)"})
+			}
 		} else {
 			out = append(out, DoctorFinding{"ok", "webhook", addr})
 		}

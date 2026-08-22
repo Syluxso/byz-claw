@@ -76,8 +76,17 @@ func main() {
 		must(err)
 		fmt.Println(out.Text)
 	case "gateway":
-		fmt.Fprintln(os.Stderr, "gateway: not fully wired yet (use run --text for now)")
-		os.Exit(2)
+		fs := flag.NewFlagSet("gateway", flag.ExitOnError)
+		homeFlag := fs.String("home", "", "BYZCLAW_HOME")
+		noCLI := fs.Bool("no-cli", false, "disable stdin REPL")
+		webhook := fs.Bool("webhook", false, "force-enable webhook channel")
+		_ = fs.Parse(args)
+		root, err := home.Resolve(*homeFlag)
+		must(err)
+		must(app.RunGateway(root, app.GatewayOptions{
+			CLI:     !*noCLI,
+			Webhook: *webhook,
+		}))
 	default:
 		fmt.Fprintf(os.Stderr, "byzclaw: unknown command %q\n", cmd)
 		printHelp()
@@ -99,10 +108,17 @@ Usage:
   byzclaw onboard [--home DIR] [--yes]
   byzclaw doctor  [--home DIR]
   byzclaw run --text "..." [--home DIR] [--session ID]
+  byzclaw gateway [--home DIR] [--no-cli] [--webhook]
   byzclaw version
   byzclaw help
 
 Environment:
   BYZCLAW_HOME   default ~/.byzclaw
+  XAI_API_KEY / OPENAI_API_KEY  optional if secrets/<api_key_secret> missing
+
+Gateway:
+  Starts doctor, recovers incomplete runs, then serves channels.
+  CLI REPL is on by default. Enable webhook in config.yaml or pass --webhook.
+  Public webhook binds require allow_public + secrets/webhook_token.
 `)
 }

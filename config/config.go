@@ -41,6 +41,7 @@ type ChannelWebhook struct {
 	Addr        string `yaml:"addr"`
 	Path        string `yaml:"path"`
 	AllowPublic bool   `yaml:"allow_public"`
+	// Token is loaded from secrets/webhook_token when present (not stored in YAML).
 }
 
 type ToolsConfig struct {
