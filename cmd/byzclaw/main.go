@@ -80,12 +80,14 @@ func main() {
 		homeFlag := fs.String("home", "", "BYZCLAW_HOME")
 		noCLI := fs.Bool("no-cli", false, "disable stdin REPL")
 		webhook := fs.Bool("webhook", false, "force-enable webhook channel")
+		telegram := fs.Bool("telegram", false, "force-enable telegram channel")
 		_ = fs.Parse(args)
 		root, err := home.Resolve(*homeFlag)
 		must(err)
 		must(app.RunGateway(root, app.GatewayOptions{
-			CLI:     !*noCLI,
-			Webhook: *webhook,
+			CLI:      !*noCLI,
+			Webhook:  *webhook,
+			Telegram: *telegram,
 		}))
 	default:
 		fmt.Fprintf(os.Stderr, "byzclaw: unknown command %q\n", cmd)
@@ -108,7 +110,7 @@ Usage:
   byzclaw onboard [--home DIR] [--yes]
   byzclaw doctor  [--home DIR]
   byzclaw run --text "..." [--home DIR] [--session ID]
-  byzclaw gateway [--home DIR] [--no-cli] [--webhook]
+  byzclaw gateway [--home DIR] [--no-cli] [--webhook] [--telegram]
   byzclaw version
   byzclaw help
 
@@ -118,7 +120,9 @@ Environment:
 
 Gateway:
   Starts doctor, recovers incomplete runs, then serves channels.
-  CLI REPL is on by default. Enable webhook in config.yaml or pass --webhook.
+  CLI REPL is on by default. Enable webhook/telegram in config.yaml or pass flags.
+  Telegram requires secrets/<token_secret> and non-empty allow_from.
   Public webhook binds require allow_public + secrets/webhook_token.
+  Heartbeat (config.heartbeat.enabled) injects HEARTBEAT.md on an interval.
 `)
 }

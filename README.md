@@ -36,6 +36,9 @@ See [`BYZCLAW_BUILD_PLAN.md`](./BYZCLAW_BUILD_PLAN.md).
 
 ## Status
 
-Core loop, store, jail, tools, onboard/doctor/run, skills, compaction, middleware, **gateway + webhook** are in. Telegram / heartbeat ticker still next.
+Core loop, store, jail, tools, onboard/doctor/run, skills, compaction, middleware, gateway, webhook, **Telegram**, and **heartbeat** are in.
+
+Enable Telegram in `config.yaml` (`channels.telegram.enabled`, `allow_from: ["your_chat_id"]`) and `secrets/telegram_bot`.  
+Enable heartbeat with `heartbeat.enabled: true`.
 
 Binary size target ≤ ~35MB (do not claim 7–10MB).

@@ -5,20 +5,24 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Syluxso/byzclaw/internal/adapters/channel/cli"
+	"github.com/Syluxso/byzclaw/internal/adapters/channel/telegram"
 	"github.com/Syluxso/byzclaw/internal/adapters/channel/webhook"
 	"github.com/Syluxso/byzclaw/internal/adapters/secrets"
+	"github.com/Syluxso/byzclaw/internal/core"
 	"github.com/Syluxso/byzclaw/internal/ports"
 	clawlog "github.com/Syluxso/byzclaw/log"
 )
 
 // GatewayOptions controls which channels start.
 type GatewayOptions struct {
-	CLI     bool // stdin REPL
-	Webhook bool // force-enable webhook even if config disabled (optional)
+	CLI      bool // stdin REPL unless --no-cli
+	Webhook  bool // force-enable webhook
+	Telegram bool // force-enable telegram
 }
 
 // RunGateway doctors, recovers incomplete runs, starts channels, and serves the inbox.
@@ -49,6 +53,7 @@ func RunGateway(homeRoot string, opts GatewayOptions) error {
 
 	inbox := make(chan ports.Inbound, 32)
 	var channels []ports.Channel
+	sec := &secrets.FileSecrets{Dir: rt.Home.Secrets}
 
 	// opts.CLI is true unless --no-cli; still requires channels.cli.enabled in config.
 	if opts.CLI && rt.Config.Channels.CLI.Enabled {
@@ -57,16 +62,14 @@ func RunGateway(homeRoot string, opts GatewayOptions) error {
 			return fmt.Errorf("cli channel: %w", err)
 		}
 		channels = append(channels, ch)
-		rt.Loop.Channel = ch // replies print to stdout
+		rt.Loop.Channel = ch
 		clawlog.Info("channel_started", map[string]any{"channel": "cli"})
 	}
 
 	whEnabled := rt.Config.Channels.Webhook.Enabled || opts.Webhook
 	if whEnabled {
 		token := ""
-		secName := "webhook_token"
-		sec := &secrets.FileSecrets{Dir: rt.Home.Secrets}
-		if v, err := sec.Get(ctx, secName); err == nil {
+		if v, err := sec.Get(ctx, "webhook_token"); err == nil {
 			token = v
 		}
 		addr := rt.Config.Channels.Webhook.Addr
@@ -91,8 +94,61 @@ func RunGateway(homeRoot string, opts GatewayOptions) error {
 		})
 	}
 
-	if len(channels) == 0 {
-		return fmt.Errorf("no channels enabled (enable channels.cli and/or channels.webhook)")
+	tgEnabled := rt.Config.Channels.Telegram.Enabled || opts.Telegram
+	if tgEnabled {
+		if len(rt.Config.Channels.Telegram.AllowFrom) == 0 {
+			return fmt.Errorf("telegram enabled but allow_from is empty")
+		}
+		tokName := rt.Config.Channels.Telegram.TokenSecret
+		if tokName == "" {
+			tokName = "telegram_bot"
+		}
+		token, err := sec.Get(ctx, tokName)
+		if err != nil || strings.TrimSpace(token) == "" {
+			return fmt.Errorf("telegram requires secrets/%s", tokName)
+		}
+		ch := &telegram.Channel{
+			Token:     token,
+			AllowFrom: rt.Config.Channels.Telegram.AllowFrom,
+		}
+		if err := ch.Start(ctx, inbox); err != nil {
+			return fmt.Errorf("telegram channel: %w", err)
+		}
+		channels = append(channels, ch)
+		clawlog.Info("channel_started", map[string]any{
+			"channel":    "telegram",
+			"allow_from": len(rt.Config.Channels.Telegram.AllowFrom),
+		})
+	}
+
+	if rt.Config.Heartbeat.Enabled {
+		interval, err := rt.Config.HeartbeatInterval()
+		if err != nil {
+			return fmt.Errorf("heartbeat interval: %w", err)
+		}
+		loc := time.Local
+		if tz := rt.Config.Heartbeat.QuietHours.Timezone; tz != "" && !strings.EqualFold(tz, "local") {
+			if l, err := time.LoadLocation(tz); err == nil {
+				loc = l
+			}
+		}
+		hb := core.HeartbeatConfig{
+			Enabled:  true,
+			Interval: interval,
+			Start:    rt.Config.Heartbeat.QuietHours.Start,
+			End:      rt.Config.Heartbeat.QuietHours.End,
+			Location: loc,
+			FilePath: rt.Home.Heartbeat,
+			Session:  "heartbeat:local",
+		}
+		if err := core.StartHeartbeat(ctx, hb, inbox); err != nil {
+			return fmt.Errorf("heartbeat: %w", err)
+		}
+		clawlog.Info("heartbeat_started", map[string]any{"interval": interval.String()})
+	}
+
+	if len(channels) == 0 && !rt.Config.Heartbeat.Enabled {
+		return fmt.Errorf("no channels enabled (cli / webhook / telegram) and heartbeat disabled")
 	}
 
 	clawlog.Info("gateway_ready", map[string]any{"home": homeRoot, "channels": len(channels)})
@@ -115,9 +171,9 @@ func RunGateway(homeRoot string, opts GatewayOptions) error {
 			}
 			clawlog.Info("run_ok", map[string]any{
 				"session": in.SessionID,
+				"kind":    in.Kind,
 				"ms":      time.Since(start).Milliseconds(),
 			})
-			// Prefer channel matching the inbound source for replies.
 			replied := false
 			for _, ch := range channels {
 				if ch.Name() == in.Channel {
