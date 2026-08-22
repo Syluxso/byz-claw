@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Syluxso/byzclaw/config"
+	"github.com/Syluxso/byzclaw/internal/adapters/hooks"
 	"github.com/Syluxso/byzclaw/internal/adapters/model"
 	"github.com/Syluxso/byzclaw/internal/adapters/secrets"
 	storeadapter "github.com/Syluxso/byzclaw/internal/adapters/store"
@@ -22,6 +24,7 @@ type Runtime struct {
 	Store  *storeadapter.SQLite
 	Loop   *core.Loop
 	Model  ports.Model
+	Skills []ports.Skill
 }
 
 func OpenRuntime(homeRoot string) (*Runtime, error) {
@@ -39,11 +42,9 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 		return nil, err
 	}
 
-	wsRoot := filepath.Join(p.Root, cfg.Tools.Workspace.Root)
-	if !filepath.IsAbs(cfg.Tools.Workspace.Root) {
-		wsRoot = filepath.Join(p.Root, cfg.Tools.Workspace.Root)
-	} else {
-		wsRoot = cfg.Tools.Workspace.Root
+	wsRoot := cfg.Tools.Workspace.Root
+	if !filepath.IsAbs(wsRoot) {
+		wsRoot = filepath.Join(p.Root, wsRoot)
 	}
 	wsPolicy, err := core.NewPathPolicy(wsRoot)
 	if err != nil {
@@ -58,20 +59,54 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 		return nil, err
 	}
 
-	tools := []ports.Tool{}
-	tools = append(tools, (&tooladapter.Workspace{Policy: wsPolicy}).Tools()...)
-	tools = append(tools, (&tooladapter.MemoryTools{Policy: memPolicy}).Tools()...)
-	tools = append(tools, tooladapter.NewHTTPFetch(cfg.Tools.HTTPFetch.MaxBytes, cfg.Tools.HTTPFetch.TimeoutSeconds))
+	allTools := []ports.Tool{}
+	allTools = append(allTools, (&tooladapter.Workspace{Policy: wsPolicy}).Tools()...)
+	allTools = append(allTools, (&tooladapter.MemoryTools{Policy: memPolicy}).Tools()...)
+	allTools = append(allTools, tooladapter.NewHTTPFetch(cfg.Tools.HTTPFetch.MaxBytes, cfg.Tools.HTTPFetch.TimeoutSeconds))
+
+	skillsDir := cfg.Skills.Dir
+	if !filepath.IsAbs(skillsDir) {
+		skillsDir = filepath.Join(p.Root, skillsDir)
+	}
+	// Also load bundled example skills from install cwd if home skills empty.
+	skills, _ := core.LoadSkillsDir(skillsDir)
+	if len(skills) == 0 {
+		if bundled, err := core.LoadSkillsDir(filepath.Join(p.Root, "skills")); err == nil {
+			skills = bundled
+		}
+	}
+
+	toolMap := map[string]ports.Tool{}
+	for _, t := range allTools {
+		toolMap[t.Name()] = t
+	}
+	toolMap = core.FilterToolsBySkills(toolMap, skills)
+	tools := make([]ports.Tool, 0, len(toolMap))
+	for _, t := range toolMap {
+		tools = append(tools, t)
+	}
 
 	sec := &secrets.FileSecrets{Dir: p.Secrets}
-	apiKey, _ := sec.Get(context.Background(), cfg.Model.APIKeySecret)
+	apiKey, keyErr := sec.Get(context.Background(), cfg.Model.APIKeySecret)
+	if keyErr != nil {
+		apiKey = strings.TrimSpace(os.Getenv("XAI_API_KEY"))
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		}
+	}
 
 	var mdl ports.Model
 	switch cfg.Model.Provider {
-	case "openai_compat", "":
-		mdl = model.NewOpenAICompat(cfg.Model.BaseURL, apiKey, cfg.Model.Model)
 	case "fake":
 		mdl = &model.Fake{Queue: []ports.CompletionResponse{{Content: "fake ok"}}}
+	case "local_demo":
+		mdl = model.LocalDemo{}
+	case "openai_compat", "":
+		if apiKey == "" {
+			mdl = model.LocalDemo{}
+		} else {
+			mdl = model.NewOpenAICompat(cfg.Model.BaseURL, apiKey, cfg.Model.Model)
+		}
 	default:
 		_ = st.Close()
 		return nil, fmt.Errorf("unknown model provider %q", cfg.Model.Provider)
@@ -85,9 +120,10 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 		Profile:               cfg.Loop.Profile,
 	}
 	loop := core.NewLoop(st, mdl, tools, wsPolicy, loopCfg)
-	loop.SystemPrompt = buildSystemPrompt(p)
+	loop.SystemPrompt = buildSystemPrompt(p, skills)
+	loop.Hooks = buildHooks(cfg)
 
-	return &Runtime{Home: p, Config: cfg, Store: st, Loop: loop, Model: mdl}, nil
+	return &Runtime{Home: p, Config: cfg, Store: st, Loop: loop, Model: mdl, Skills: skills}, nil
 }
 
 func (r *Runtime) Close() error {
@@ -97,7 +133,7 @@ func (r *Runtime) Close() error {
 	return r.Store.Close()
 }
 
-func buildSystemPrompt(p home.Paths) string {
+func buildSystemPrompt(p home.Paths, skills []ports.Skill) string {
 	var b string
 	b += "You are byzclaw, a personal AI assistant with tools. Prefer tools for file and fetch work.\n"
 	b += "Never claim you wrote a file or fetched a URL unless you called the matching tool.\n"
@@ -107,5 +143,29 @@ func buildSystemPrompt(p home.Paths) string {
 	if raw, err := os.ReadFile(p.MemoryMD); err == nil && len(raw) > 0 && len(raw) < 50_000 {
 		b += "\n# MEMORY\n" + string(raw) + "\n"
 	}
+	b += core.SkillsPrompt(skills)
 	return b
+}
+
+func buildHooks(cfg config.Config) []ports.Hook {
+	wanted := map[string]bool{}
+	for _, n := range cfg.Middleware {
+		wanted[n] = true
+	}
+	if len(wanted) == 0 {
+		wanted["audit"] = true
+		wanted["pii"] = true
+		wanted["token_ceiling"] = true
+	}
+	var out []ports.Hook
+	if wanted["audit"] {
+		out = append(out, hooks.AuditSuite()...)
+	}
+	if wanted["pii"] {
+		out = append(out, hooks.PII{})
+	}
+	if wanted["token_ceiling"] {
+		out = append(out, hooks.TokenCeiling{Ceiling: cfg.Loop.TokenCeiling})
+	}
+	return out
 }

@@ -103,8 +103,19 @@ func (l *Loop) Handle(ctx context.Context, in ports.Inbound) (ports.Outbound, er
 		return l.fail(ctx, run, err)
 	}
 
-	errCounts := map[string]int{}
+	return l.continueRun(ctx, &run, in, hc, map[string]int{})
+}
 
+func (l *Loop) continueRun(
+	ctx context.Context,
+	run *ports.Run,
+	in ports.Inbound,
+	hc *ports.HookContext,
+	errCounts map[string]int,
+) (ports.Outbound, error) {
+	if errCounts == nil {
+		errCounts = map[string]int{}
+	}
 	for {
 		if run.Iteration >= l.Config.MaxToolIterations {
 			_ = l.runHooks(ctx, ports.HookOnLimit, hc)
@@ -112,52 +123,55 @@ func (l *Loop) Handle(ctx context.Context, in ports.Inbound) (ports.Outbound, er
 			run.Status = ports.RunFailed
 			run.Error = "max_tool_iterations"
 			run.UpdatedAt = l.Clock.Now()
-			_ = l.Store.SaveRun(ctx, run)
+			_ = l.Store.SaveRun(ctx, *run)
 			return out, nil
 		}
 
 		msgs, err := l.Store.ListMessages(ctx, in.SessionID, 500)
 		if err != nil {
-			return l.fail(ctx, run, err)
+			return l.fail(ctx, *run, err)
 		}
+		msgs, _ = l.CompactIfNeeded(ctx, in.SessionID, msgs)
+
+		prompt := msgs
 		if l.SystemPrompt != "" {
-			msgs = append([]ports.Message{{
+			prompt = append([]ports.Message{{
 				Role: "system", Content: l.SystemPrompt, CreatedAt: l.Clock.Now(),
 			}}, msgs...)
 		}
 		if err := l.runHooks(ctx, ports.HookBeforeModel, hc); err != nil {
-			return l.fail(ctx, run, err)
+			return l.fail(ctx, *run, err)
 		}
 
 		run.Status = ports.RunModel
 		run.UpdatedAt = l.Clock.Now()
-		_ = l.Store.SaveRun(ctx, run)
+		_ = l.Store.SaveRun(ctx, *run)
 
 		resp, err := l.Model.Complete(ctx, ports.CompletionRequest{
-			Messages: msgs,
+			Messages: prompt,
 			Tools:    l.toolSpecs(),
 		})
 		if err != nil {
 			_ = l.runHooks(ctx, ports.HookOnError, hc)
-			return l.fail(ctx, run, err)
+			return l.fail(ctx, *run, err)
 		}
+		hc.Notes = append(hc.Notes, fmt.Sprintf("usage_total=%d", resp.Usage.Input+resp.Usage.Output))
 		if err := l.runHooks(ctx, ports.HookAfterModel, hc); err != nil {
-			return l.fail(ctx, run, err)
+			return l.fail(ctx, *run, err)
 		}
 
 		asst := ports.Message{
 			ID: newID(), SessionID: in.SessionID, Role: "assistant",
 			Content: resp.Content, ToolCalls: resp.ToolCalls, CreatedAt: l.Clock.Now(),
 		}
-		// Persist assistant (including tool_calls) BEFORE any tool execution.
 		if err := l.Store.SaveMessage(ctx, asst); err != nil {
-			return l.fail(ctx, run, err)
+			return l.fail(ctx, *run, err)
 		}
 
 		if len(resp.ToolCalls) == 0 {
 			run.Status = ports.RunCompleted
 			run.UpdatedAt = l.Clock.Now()
-			_ = l.Store.SaveRun(ctx, run)
+			_ = l.Store.SaveRun(ctx, *run)
 			_ = l.runHooks(ctx, ports.HookOnComplete, hc)
 			out := ports.Outbound{Channel: in.Channel, SessionID: in.SessionID, Text: resp.Content}
 			if l.Channel != nil {
@@ -166,64 +180,82 @@ func (l *Loop) Handle(ctx context.Context, in ports.Inbound) (ports.Outbound, er
 			return out, nil
 		}
 
-		// Serial tool_calls in v1.
 		run.Status = ports.RunToolPending
 		run.UpdatedAt = l.Clock.Now()
-		_ = l.Store.SaveRun(ctx, run)
+		_ = l.Store.SaveRun(ctx, *run)
 
-		for _, call := range resp.ToolCalls {
-			hc.ToolName = call.Name
-			hc.ToolArgs = call.Args
-			if err := l.runHooks(ctx, ports.HookBeforeTool, hc); err != nil {
-				return l.fail(ctx, run, err)
-			}
-			if l.Policy != nil {
-				if err := l.Policy.AllowTool(ctx, call.Name, call.Args); err != nil {
-					tr := ports.ToolResult{ID: call.ID, Name: call.Name, Content: err.Error(), IsError: true}
-					if err := l.persistTool(ctx, in.SessionID, tr); err != nil {
-						return l.fail(ctx, run, err)
-					}
-					continue
-				}
-			}
-			tool, ok := l.Tools[call.Name]
-			var tr ports.ToolResult
-			if !ok {
-				tr = ports.ToolResult{ID: call.ID, Name: call.Name, Content: "unknown tool: " + call.Name, IsError: true}
-			} else {
-				tr, err = tool.Exec(ctx, call)
-				if err != nil {
-					tr = ports.ToolResult{ID: call.ID, Name: call.Name, Content: err.Error(), IsError: true}
-				}
-			}
-			if err := l.runHooks(ctx, ports.HookAfterTool, hc); err != nil {
-				return l.fail(ctx, run, err)
-			}
-			// Persist tool result BEFORE next model call.
-			if err := l.persistTool(ctx, in.SessionID, tr); err != nil {
-				return l.fail(ctx, run, err)
-			}
-			if tr.IsError {
-				key := call.Name + "|" + tr.Content
-				errCounts[key]++
-				if errCounts[key] >= 3 {
-					run.Status = ports.RunFailed
-					run.Error = "repeated tool error: " + call.Name
-					run.UpdatedAt = l.Clock.Now()
-					_ = l.Store.SaveRun(ctx, run)
-					return ports.Outbound{
-						Channel: in.Channel, SessionID: in.SessionID,
-						Text: "Stopped: tool " + call.Name + " failed repeatedly.",
-					}, nil
-				}
-			}
+		stop, out, err := l.execToolCalls(ctx, run, in, hc, resp.ToolCalls, errCounts)
+		if err != nil {
+			return l.fail(ctx, *run, err)
+		}
+		if stop {
+			return out, nil
 		}
 
 		run.Status = ports.RunToolDone
 		run.Iteration++
 		run.UpdatedAt = l.Clock.Now()
-		_ = l.Store.SaveRun(ctx, run)
+		_ = l.Store.SaveRun(ctx, *run)
 	}
+}
+
+func (l *Loop) execToolCalls(
+	ctx context.Context,
+	run *ports.Run,
+	in ports.Inbound,
+	hc *ports.HookContext,
+	calls []ports.ToolCall,
+	errCounts map[string]int,
+) (stop bool, out ports.Outbound, err error) {
+	for _, call := range calls {
+		hc.ToolName = call.Name
+		hc.ToolArgs = call.Args
+		if err := l.runHooks(ctx, ports.HookBeforeTool, hc); err != nil {
+			return true, ports.Outbound{}, err
+		}
+		var tr ports.ToolResult
+		if l.Policy != nil {
+			if err := l.Policy.AllowTool(ctx, call.Name, call.Args); err != nil {
+				tr = ports.ToolResult{ID: call.ID, Name: call.Name, Content: err.Error(), IsError: true}
+				if err := l.persistTool(ctx, in.SessionID, tr); err != nil {
+					return true, ports.Outbound{}, err
+				}
+				_ = l.runHooks(ctx, ports.HookAfterTool, hc)
+				continue
+			}
+		}
+		tool, ok := l.Tools[call.Name]
+		if !ok {
+			tr = ports.ToolResult{ID: call.ID, Name: call.Name, Content: "unknown tool: " + call.Name, IsError: true}
+		} else {
+			var execErr error
+			tr, execErr = tool.Exec(ctx, call)
+			if execErr != nil {
+				tr = ports.ToolResult{ID: call.ID, Name: call.Name, Content: execErr.Error(), IsError: true}
+			}
+		}
+		if err := l.runHooks(ctx, ports.HookAfterTool, hc); err != nil {
+			return true, ports.Outbound{}, err
+		}
+		if err := l.persistTool(ctx, in.SessionID, tr); err != nil {
+			return true, ports.Outbound{}, err
+		}
+		if tr.IsError {
+			key := call.Name + "|" + tr.Content
+			errCounts[key]++
+			if errCounts[key] >= 3 {
+				run.Status = ports.RunFailed
+				run.Error = "repeated tool error: " + call.Name
+				run.UpdatedAt = l.Clock.Now()
+				_ = l.Store.SaveRun(ctx, *run)
+				return true, ports.Outbound{
+					Channel: in.Channel, SessionID: in.SessionID,
+					Text: "Stopped: tool " + call.Name + " failed repeatedly.",
+				}, nil
+			}
+		}
+	}
+	return false, ports.Outbound{}, nil
 }
 
 func (l *Loop) persistTool(ctx context.Context, sessionID string, tr ports.ToolResult) error {
@@ -241,20 +273,110 @@ func (l *Loop) fail(ctx context.Context, run ports.Run, err error) (ports.Outbou
 	return ports.Outbound{}, err
 }
 
-// RecoverIncomplete marks unsafe incomplete runs failed. Resume of partial tool results is later.
+// RecoverIncomplete resumes runs that have assistant tool_calls with missing tool results.
+// Otherwise marks the run failed (never invents results).
 func (l *Loop) RecoverIncomplete(ctx context.Context) error {
 	runs, err := l.Store.ListIncompleteRuns(ctx)
 	if err != nil {
 		return err
 	}
 	for _, r := range runs {
-		// v1: mark failed rather than invent tool results.
-		r.Status = ports.RunFailed
-		r.Error = "interrupted; marked failed on recovery"
-		r.UpdatedAt = l.Clock.Now()
-		_ = l.Store.SaveRun(ctx, r)
+		if err := l.resumeOne(ctx, r); err != nil {
+			r.Status = ports.RunFailed
+			r.Error = "recovery failed: " + err.Error()
+			r.UpdatedAt = l.Clock.Now()
+			_ = l.Store.SaveRun(ctx, r)
+		}
 	}
 	return nil
+}
+
+func (l *Loop) resumeOne(ctx context.Context, r ports.Run) error {
+	msgs, err := l.Store.ListMessages(ctx, r.SessionID, 500)
+	if err != nil {
+		return err
+	}
+	asst, missing := missingToolCalls(msgs)
+	if asst == nil {
+		r.Status = ports.RunFailed
+		r.Error = "interrupted; no resumable tool_calls"
+		r.UpdatedAt = l.Clock.Now()
+		return l.Store.SaveRun(ctx, r)
+	}
+	if len(missing) == 0 {
+		// Tools done but model not finished — continue loop without new user message.
+		r.Status = ports.RunToolDone
+		r.UpdatedAt = l.Clock.Now()
+		_ = l.Store.SaveRun(ctx, r)
+		in := ports.Inbound{Channel: "system", SessionID: r.SessionID, Kind: "system", Text: ""}
+		hc := &ports.HookContext{Run: &r, Session: r.SessionID, Inbound: &in}
+		_, err := l.continueRun(ctx, &r, in, hc, map[string]int{})
+		return err
+	}
+
+	l.mu.Lock()
+	if l.active[r.SessionID] {
+		l.mu.Unlock()
+		return fmt.Errorf("session busy")
+	}
+	l.active[r.SessionID] = true
+	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		delete(l.active, r.SessionID)
+		l.mu.Unlock()
+	}()
+
+	in := ports.Inbound{Channel: "system", SessionID: r.SessionID, Kind: "system"}
+	hc := &ports.HookContext{Run: &r, Session: r.SessionID, Inbound: &in}
+	r.Status = ports.RunToolPending
+	r.UpdatedAt = l.Clock.Now()
+	_ = l.Store.SaveRun(ctx, r)
+
+	stop, _, err := l.execToolCalls(ctx, &r, in, hc, missing, map[string]int{})
+	if err != nil {
+		return err
+	}
+	if stop {
+		return nil
+	}
+	r.Status = ports.RunToolDone
+	r.Iteration++
+	r.UpdatedAt = l.Clock.Now()
+	_ = l.Store.SaveRun(ctx, r)
+	_, err = l.continueRun(ctx, &r, in, hc, map[string]int{})
+	return err
+}
+
+func missingToolCalls(msgs []ports.Message) (asst *ports.Message, missing []ports.ToolCall) {
+	var last *ports.Message
+	for i := range msgs {
+		if msgs[i].Role == "assistant" && len(msgs[i].ToolCalls) > 0 {
+			last = &msgs[i]
+		}
+	}
+	if last == nil {
+		return nil, nil
+	}
+	have := map[string]bool{}
+	seenLast := false
+	for _, m := range msgs {
+		if !seenLast {
+			if m.ID == last.ID {
+				seenLast = true
+			}
+			continue
+		}
+		if m.Role == "tool" && m.ToolCallID != "" {
+			have[m.ToolCallID] = true
+		}
+	}
+	for _, tc := range last.ToolCalls {
+		if !have[tc.ID] {
+			missing = append(missing, tc)
+		}
+	}
+	return last, missing
 }
 
 func newID() string {

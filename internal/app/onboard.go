@@ -34,6 +34,8 @@ func Onboard(homeRoot string, interactive bool) error {
 	writeIfMissing(p.Soul, "# Soul\n\nYou are a helpful personal assistant running as byzclaw.\n")
 	writeIfMissing(p.MemoryMD, "# Memory\n\nLong-term notes live here and under memory/.\n")
 	writeIfMissing(p.Heartbeat, "# Heartbeat\n\nInstructions for periodic heartbeat runs.\n")
+	// Seed example skill if skills dir empty.
+	seedExampleSkill(p.Skills)
 
 	sec := &secrets.FileSecrets{Dir: p.Secrets}
 	secretPath := p.Secrets + string(os.PathSeparator) + cfg.Model.APIKeySecret
@@ -73,4 +75,21 @@ func writeIfMissing(path, content string) {
 	}
 	_ = os.WriteFile(path, []byte(content), 0o644)
 	fmt.Println("wrote", path)
+}
+
+func seedExampleSkill(skillsDir string) {
+	dst := skillsDir + string(os.PathSeparator) + "example-note" + string(os.PathSeparator) + "SKILL.md"
+	if _, err := os.Stat(dst); err == nil {
+		return
+	}
+	_ = os.MkdirAll(skillsDir+string(os.PathSeparator)+"example-note", 0o755)
+	content := `---
+id: daily-note
+name: Daily note
+tools: [workspace_list, workspace_read, workspace_write, memory_read, memory_write, http_fetch]
+---
+When the user asks to jot a note, write markdown under workspace/notes/.
+`
+	_ = os.WriteFile(dst, []byte(content), 0o644)
+	fmt.Println("wrote", dst)
 }
