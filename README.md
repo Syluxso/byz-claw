@@ -34,15 +34,16 @@ curl -s http://127.0.0.1:8743/hook -H 'Content-Type: application/json' \
   -d '{"session_id":"demo","text":"write hi to workspace/from-hook.md"}'
 ```
 
-## Spec
+## Spec & design pattern
 
-See [`BYZCLAW_BUILD_PLAN.md`](./BYZCLAW_BUILD_PLAN.md).
+- **Concrete plan (v4):** [`BYZCLAW_BUILD_PLAN.md`](./BYZCLAW_BUILD_PLAN.md) — schedules → tasks; inbox → wake; skills DB registry  
+- **Design pattern:** [`docs/CODE_FIRST_LLM_LAST.md`](./docs/CODE_FIRST_LLM_LAST.md) — when tempted to “make it smarter with more prompt,” **this wins**
 
 ## Status
 
-Core loop, store, jail, tools, onboard/doctor/run, skills, compaction, middleware, gateway, webhook, **Telegram**, and **heartbeat** are in.
+Core loop, store, jail, tools, onboard/doctor/run, skills (file → migrate to DB), compaction, middleware, gateway, webhook, and Telegram are in.  
+**Next (v4):** tasks + inbox + schedules + skills registry; **remove** HEARTBEAT runtime.
 
-Enable Telegram in `config.yaml` (`channels.telegram.enabled`, `allow_from: ["your_chat_id"]`) and `secrets/telegram_bot`.  
-Enable heartbeat with `heartbeat.enabled: true`.
+Enable Telegram in `config.yaml` (`channels.telegram.enabled`, `allow_from: ["your_chat_id"]`) and `secrets/telegram_bot`.
 
 Binary size target ≤ ~35MB (do not claim 7–10MB).
