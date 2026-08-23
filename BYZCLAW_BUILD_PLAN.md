@@ -1,4 +1,4 @@
-# byz-claw — Grok Build Implementation Spec (v3)
+# byz-claw — Grok Build Implementation Spec (v4)
 
 Hand this entire file to local Grok Build. It is the source of truth.
 Prefer this over inventing structure, over OpenClaw clones, and over "EnterpriseClaw" MVC demos.
@@ -16,376 +16,322 @@ Prefer this over inventing structure, over OpenClaw clones, and over "Enterprise
 | Language | Go, vanilla `net/http` (1.22+ ServeMux). No Gin/Echo/Chi required. |
 | Architecture | 12-factor daemon + standard Go `cmd/` `internal/` + hexagonal ports. |
 | Loop | **Fixed state machine.** Not a plugin. Hooks hang off named stages. |
-| Extensibility | Skills = markdown files. Tools/channels = Go adapters, explicit register. |
+| Extensibility | **Skills = DB registry** (+ optional body/playbook). Tools/channels = Go adapters, explicit register. |
 | DX for coding agents | Convention-over-configuration **layout and names**, not directory auto-scan of `.go`. |
 | Core vs full | Same `internal/core`. Full only registers extra adapters (UI, browser later). |
 | Enterprise v1 | Policy, audit, secrets, doctor, allowlists — not SSO mothership / Vault / CRDs. |
 | Size honesty | Core target ≤ ~35MB binary, idle tens of MB RAM. Do **not** claim 7–10MB. |
 | Build | `CGO_ENABLED=0` `-ldflags="-s -w"`. No UPX. Prefer `modernc.org/sqlite` (no CGO). |
-| **Tasks vs inbox** | **Tasks** = durable completion contracts. **Inbox** = short session pending buffer. Never call the buffer a "queue" in product docs (avoids Kafka/Rabbit confusion). |
+| **Tasks vs inbox** | **Tasks** = durable completion contracts. **Inbox** = agent activation / pending work. Never call the buffer a "queue" in product docs. |
 | **Task truth** | Status in SQLite is the only completion truth. The model does not "vibe complete." |
-| **Approval** | Agent-owned work that requires human gate uses policy: block parent + open `owner=user` approval task — not a separate subsystem. |
+| **Approval** | Agent-owned work that requires human gate: block parent + open `owner=user` approval task. |
+| **Scheduler vs agent** | **Scheduler is not the agent.** No LLM. Every N seconds/minutes: mint due tasks from schedules; optionally enqueue inbox wakes. |
+| **HEARTBEAT** | **Removed** as a runtime system. No `HEARTBEAT.md` pulse. Periodic work = schedules → tasks → optional inbox. |
+| **Agent wake** | Agent runs **only** because inbox has work (user message, task wake, system). Empty inbox → idle. |
+| **Skills** | Registered in DB. Optional short `content` and/or `md_ref` / `playbook_ref`. Loop prefers **tools**; playbook applies deterministically. |
 
 **Rule:** *The loop is not a plugin. The loop has plugins (middleware/hooks).*
 
-**Rule:** *Inbox feeds the loop. Tasks annotate what "finished" means across time. Neither replaces `Loop.Handle`.*
+**Rule:** *Inbox activates the agent. Tasks define finished. Scheduler only mints (and may request wake).*
 
 ---
 
-## 1. Positioning (code and README must not violate)
+## 0b. Corrected design bullets (canonical)
+
+Use these phrasings (not the older heartbeat-centric ones):
+
+1. **Scheduler + tasks replace HEARTBEAT**  
+   - Scheduler: time-driven, no LLM; evaluates `schedules`, mints `tasks`, may enqueue inbox.  
+   - Not named "cron" as the product — cron/interval is just the tick expression.  
+   - Tick interval default **15–60s** (not 1s unless justified).
+
+2. **Skills are DB-registered**  
+   - Row is source of runtime truth after doctor sync.  
+   - **May** attach short `content` **or** `md_ref` (file) **or** `playbook_ref` (JSON).  
+   - Prefer tools + playbook over long "LLM read this skill" prose.  
+   - Git-friendly: hand-written `skills/*/SKILL.md` remain; **doctor** upserts them into the DB.
+
+### Also required (do not miss)
+
+| Item | Why |
+|---|---|
+| **Inbox ≠ task row** | Inbox item **references** `task_id`; task is not moved into inbox |
+| **Not every task wakes the agent** | Reminders / far-future / user-owned may never enqueue |
+| **`due_at` optional** | Null = not time-driven; past/now due = eligible on next scheduler pass |
+| **Recurring = schedule template** | Each fire mints a **new** task instance + `dedupe_key` |
+| **Playbook is deterministic** | Ensure schedules/tasks/inbox/artifacts — applied by runtime, not model improvisation |
+| **SOUL.md / MEMORY.md stay files** | Persona + long-term notes; not the skill registry |
+| **Remove StartHeartbeat / HEARTBEAT.md** | From gateway, onboard seed, doctor checks, config `heartbeat.*` |
+| **Tables** | `messages`, `runs`, `tasks`, `inbox`, `schedules`, `skills` |
+
+---
+
+## 1. Positioning
 
 ### Goals
 - Download → onboard → message it → real work (files, fetch, memory)
 - Durable tool loop (crash-safe; no dangling `tool_call_id`s)
 - Safe defaults: shell off, path jail, SSRF block, secrets redacted, localhost webhook
-- Skills as `SKILL.md`; optional `SOUL.md` `MEMORY.md` `HEARTBEAT.md`
-- `doctor` tells the truth before you trust the process
-- Durable **tasks** (user / agent / process commitments) and **inbox** (pending inbound while a run is busy)
-- Simple day-one; same ports scale to long-running and enterprise adapters later
+- Skills **registered in DB**; optional body/playbook; tools first
+- `doctor` tells the truth (incl. skill file ↔ DB sync)
+- **Schedules**, **tasks**, **inbox** — not HEARTBEAT.md
+- Agent idle when inbox empty; works only when inbox has items
 
 ### Non-goals v1
-- Skill marketplace / ClawHub
-- Browser (core)
-- Electron / Node
-- Kafka, gRPC control plane, K8s operator, Uber FX
-- Go plugins / `.so`
-- User-written `Agent.Execute()` controllers
-- Feature parity with OpenClaw
-- Wasm / gVisor / Firecracker (sandbox **port** may exist as `none`; real isolation later)
-- Camunda / full DAG workflow engine / Jira clone
-- Multi-agent swarm product
-- OpenClaw-style `/queue` steer|followup|collect|interrupt mode matrix as a user feature
-- Email channel (later: adapter into inbox or tasks, not "agent is Gmail")
+- Skill marketplace / ClawHub (remote *fetch* may come later; not a store product)
+- Browser (core), Electron, Node, Kafka, K8s, Go plugins, user `Agent.Execute`
+- Camunda / full DAG engine
+- Heartbeat ticker + HEARTBEAT.md as a parallel system
+- 1-second busy-poll scheduler as default
 
-### What we deliberately fix vs OpenClaw (complaints → byz-claw)
+### OpenClaw pains → byz-claw
 
-| OpenClaw pain | byz-claw stance |
+| Pain | Stance |
 |---|---|
-| Gateway RAM / OOM | Go binary; SQLite; compaction deletes rows; no unbounded session skill snapshots in heap |
-| Shell / skills / exposed gateway | Shell off; workspace jail; localhost webhook; Telegram `allow_from`; no ClawHub |
-| Broken memory backends | Durable SQLite + task rows; inject **small** open-task JSON, not MEMORY.md novels |
-| Install / Node upgrade hell | One static binary; onboard/doctor |
-| Unclear heartbeat vs cron vs "tasks" | Heartbeat = wake; **tasks** = commitments; **inbox** = pending inbound |
+| RAM / OOM | Go; SQLite; compaction deletes |
+| Shell / exposure | Shell off; jail; localhost; allow_from |
+| Fuzzy memory / "tasks" | Real task rows + inbox activation |
+| Heartbeat vs cron confusion | **Scheduler mints tasks**; inbox wakes agent |
 
 ---
 
-## 2. Architectural style (say these words in README)
+## 2. Architectural style
 
-Coding agents retrieve patterns better when names match training data:
-
-1. **12-factor daemon** — one process, config file + env, logs stdout
-2. **Standard Go layout** — `cmd/` `internal/`
-3. **Clean / hexagonal** — `core` imports only `ports` + stdlib
-4. **CLI subcommands** — `onboard` `gateway` `doctor` `version` `run` `task` (cobra optional)
-5. **Laravel/Spring middleware** — **named hook points on a fixed kernel**, not an onion around a custom Execute
-6. **Compile-time wiring** — `main` registers tools, channels, middleware explicitly
-
-Do **not** scan `app/Agents/*.go` to auto-register. That is reflection or codegen. Skills on disk are the dynamic extension. Tasks/inbox are **ports + SQLite**, not a second runtime.
+1. 12-factor daemon  
+2. Standard Go `cmd/` `internal/`  
+3. Hexagonal — core imports only ports  
+4. CLI: `onboard` `gateway` `doctor` `version` `run` `task` `schedule` (optional)  
+5. Named hook points on a fixed kernel  
+6. Compile-time tool/channel wiring; skills dynamic via DB registry  
 
 ---
 
-## 3. Repository layout
+## 3. Layout (delta from tree)
 
-```
-byzclaw/
-  README.md
-  BYZCLAW_BUILD_PLAN.md
-  go.mod
-  Makefile
-  cmd/
-    byzclaw/main.go
-    byzclaw-full/main.go
-  internal/
-    core/
-      loop.go, run.go, policy.go, compact.go, heartbeat.go
-      skills.go, workspace_files.go, hooks.go, tasks.go, inbox.go, types.go
-    ports/
-      channel.go, tool.go, model.go, store.go, task.go, inbox.go
-      memory.go, secrets.go, sandbox.go, clock.go, hooks.go
-    adapters/
-      channel/{cli,telegram,webhook}/
-      model/{openai_compat.go,local_demo.go}
-      tool/{workspace,http_fetch,memory_tool,shell,task_tools}.go
-      store/sqlite.go
-      memory/markdown.go
-      secrets/file_secrets.go
-      sandbox/none.go
-      hooks/{audit,pii,token_ceiling,task_approval}.go
-  config/, log/, skills/example-note/SKILL.md, testdata/runs/, docs/DESIGN.md
-```
+- **Remove** runtime reliance on `heartbeat.go` / HEARTBEAT.md (file may be deleted or ignored).
+- **Add** `internal/core/scheduler.go`, skill registry usage, ports for `ScheduleStore` / `SkillRegistry`.
+- **DB tables:** messages, runs, tasks, inbox, schedules, skills.
 
 ---
 
-## 4. Ports
+## 4. Ports (additions / changes)
 
-Define first. Core never imports Telegram, SQLite, YAML adapters, etc.
+### Task (extend)
 
-Same Channel / Tool / Store / Model / Hook ports as v2, **plus**:
+Add time fields:
 
-### TaskStore (durable completion contracts)
+- `DueAt *time.Time` — null = no due; past/now = due  
+- Keep: owner, status, done_when, dedupe_key, requires_approval, parent_id, …
 
-```go
-type TaskOwner string  // agent | user | run | process | system
-type TaskStatus string // open | blocked | done | cancelled
+### InboxItem (extend)
 
-type Task struct {
-    ID, Title, BodyRef string
-    Owner         TaskOwner
-    Kind          string // goal | step | procedure | approval
-    Status        TaskStatus
-    BlockedReason string
-    Source        string
-    SessionID, RunID, ParentID, BlocksTaskID string
-    DoneWhen      string
-    RequiresApproval bool
-    DedupeKey     string
-    Metadata      json.RawMessage
-    CreatedAt, UpdatedAt time.Time
-    CompletedAt   *time.Time
-}
+- `TaskID string` — optional link; **task is not copied into inbox**  
+- `Kind` — `user_message` | `task_wake` | `system`  
+- Payload for channel text when needed  
 
-type TaskStore interface {
-    Create(ctx context.Context, t Task) (Task, error)
-    Get(ctx context.Context, id string) (Task, error)
-    List(ctx context.Context, f TaskFilter) ([]Task, error)
-    ListOpen(ctx context.Context, owner TaskOwner, limit int) ([]Task, error)
-    UpdateStatus(ctx context.Context, id string, status TaskStatus, reason string) error
-    Complete(ctx context.Context, id string) error
-    Block(ctx context.Context, id string, reason string) error
-    Cancel(ctx context.Context, id string, reason string) error
-}
+### ScheduleStore
+
+```text
+Schedule:
+  id, name, enabled
+  spec          // cron expression OR interval duration
+  task_template // title, owner, done_when, requires_approval, metadata…
+  wake          // none | on_mint | when_due
+  dedupe_template // e.g. "daily-digest-{{date}}"
+  quiet_hours optional override
+  last_fired_at
 ```
 
-### InboxStore (session pending buffer — not a "queue")
+Scheduler loop: tick → list enabled schedules due → mint task (honor dedupe) → if wake policy → Inbox.Enqueue(task_id=…).
 
-```go
-type InboxState string // pending | delivered | dropped
+Also: each tick may **scan tasks** with `due_at <= now` and status open and wake-eligible → enqueue once (dedupe).
 
-type InboxItem struct {
-    ID, SessionID, Channel, ExternalID string
-    Payload        json.RawMessage
-    State          InboxState
-    ArrivedAt      time.Time
-    DeliveredRunID string
-    Attempts       int
-    LastError      string
-}
+### SkillRegistry
 
-type InboxStore interface {
-    Enqueue(ctx context.Context, item InboxItem) (InboxItem, error)
-    ListPending(ctx context.Context, sessionID string, limit int) ([]InboxItem, error)
-    MarkDelivered(ctx context.Context, id string, runID string) error
-    Drop(ctx context.Context, id string, reason string) error
-}
+```text
+Skill:
+  id, name, enabled, source      // local|remote
+  tools_json                     // allowlist
+  content                        // optional short prose (DB field)
+  md_ref                         // optional path to SKILL.md
+  playbook_ref or playbook_json  // optional structured ensure_*
+  version, updated_at
 ```
 
-### Extra hook points
+**Playbook (versioned, small):** deterministic ensure schedules / tasks / inbox seeds / artifacts — applied by runtime on skill activate, **not** by free-form model invention.
 
-`on_task_created`, `before_task_complete`, `on_task_blocked`, `on_task_cancelled`,
-`on_inbound_buffered`, `on_inbox_drained`
-
-Tool DX: structs + JSON Schema. No Agent/Blueprint/Execute.
+**Doctor:** for each `skills/*/SKILL.md` on disk → upsert skills row; report DB-only orphans and missing files.
 
 ---
 
-## 5. Agent loop (non-negotiable)
+## 5. Agent loop
 
-```
-inbound (or drained inbox item)
+```text
+ONLY started for an inbox item (or one-shot `run` which synthesizes a single inbox-equivalent inbound)
   → on_inbound → authorize
-  → session + SOUL + skills
-  → inject ListOpen tasks (tiny JSON: id, owner, title, status, done_when)
-  → compact → before_model → model → after_model
-  → persist assistant (tool_calls) BEFORE tools
-  → each tool: before_tool → policy → Exec → after_tool → persist result
-  → iterate or outbound → on_complete
-  → reconcile owner=run tasks
-  → if idle: Inbox.Drain → next Handle
+  → SOUL + enabled skills (short content / md) + tool allowlists
+  → inject open tasks summary (tiny JSON)
+  → model ↔ tools (prefer tools)
+  → on_complete → mark inbox delivered
+  → drain next pending OR idle
 ```
 
-**Hard rules**
-
-- Never send the model an assistant `tool_calls` message without matching tool results in store.
-- `max_tool_iterations` default 12. On limit: user-visible text, `on_limit`, stop.
-- Same tool + same error 3 times → abort that path.
-- On gateway start: `ListIncompleteRuns`. Resume if safe else mark failed. Then drain pending inbox.
-- Heartbeat = `Inbound{Kind: "heartbeat"}` + `HEARTBEAT.md`; may list open tasks, not invent completion.
-- While a session has an active run, new inbound → **Inbox.Enqueue** (`pending`), not a parallel Handle.
-
-**Compaction:** defaults threshold 8000, tail 10; must **delete** compacted rows from SQLite.
-
-**Middleware:** audit, pii, token_ceiling; optional `task_approval` on `before_task_complete`.
+**No** `StartHeartbeat`. **No** parallel Handle on same session while run active — enqueue only.
 
 ---
 
-## 5b. Tasks system
+## 5b. Tasks
 
-| | **Inbox** | **Tasks** |
-|---|---|---|
-| Job | Buffer inbound while run busy | Work not finished until explicit end state |
-| Lifetime | Short | Long (across runs / heartbeats / restarts) |
-| Success | Handed to a run | Contract done or cancelled |
-| Name | inbox / pending | tasks |
+Unchanged intent from v3: owners, status machine, approval policy, tools, CLI.
 
-**Owners:** `user` | `agent` | `run` | `process` | `system`  
-**Status:** `open` → `blocked` → `done` | `cancelled`
-
-### Agent-owned, user-approved (policy)
-
-```
-Given a task needs human approval and is agent-owned (RequiresApproval)
-When the agent attempts complete
-Then parent → blocked (awaiting_approval)
-And a owner=user approval task is created (linked via ParentID / BlocksTaskID)
-And on user complete → parent unblocked/completed (reject → cancel parent)
-```
-
-Default: agent may **not** complete `owner=user` tasks.
-
-Procedures: same table + `parent_id` (flat first is OK). No DAG engine in v1.
-
-**Tools:** `task_create`, `task_list`, `task_get`, `task_complete`, `task_block`  
-**CLI:** `byzclaw task list|show|complete`
-
-**Fault tolerance:** persist before model sees task; `dedupe_key`; reconcile `owner=run` on gateway start.
-
-**Scale:** same `TaskStore` port; swap backend later; enterprise = adapters + hooks.
+Plus: **due_at**; far-future OK; never-wake OK; due past/now → scheduler may push inbox.
 
 ---
 
-## 5c. Inbox (session pending)
+## 5c. Inbox = sole wake path
 
-- Run idle → Handle immediately
-- Run active → Enqueue pending (external_id dedupe)
-- On complete / idle → drain FIFO
-- Cap + drop policy in config
-- Product name **inbox**, state **pending** — never public "queue"
+| State | Meaning |
+|---|---|
+| pending items | Agent must work (drain) |
+| empty | Agent idle |
+
+Wake sources: user channels, task_wake from scheduler/dispatcher, system.  
+Shutdown: finish/deliver items or audited purge.
+
+---
+
+## 5d. Scheduler (replaces heartbeat)
+
+**One job:** on an interval, mint due work from schedules / due tasks; optionally enqueue inbox.
+
+- Not the agent loop  
+- Not LLM  
+- Default tick: 15–60s  
+- Quiet hours supported  
+- Gateway process-local is enough for v1  
+
+---
+
+## 5e. Skills (DB registry)
+
+- Runtime lists **enabled** skills from DB  
+- Effective tools = skill allowlist ∩ enabled tools ∩ policy  
+- Optional content/md for brief guidance  
+- Playbook applied on activate when present  
+- Files under `skills/` are authoring + git; doctor syncs to DB  
 
 ---
 
 ## 6. Home directory
 
-`$BYZCLAW_HOME` default `~/.byzclaw`.
-
-```
+```text
 $BYZCLAW_HOME/
-  config.yaml, secrets/, workspace/, skills/, memory/
-  data/byzclaw.db    # messages, runs, tasks, inbox
+  config.yaml
+  secrets/
+  workspace/
+  skills/           # optional SKILL.md sources for doctor sync
+  memory/
+  data/byzclaw.db   # messages, runs, tasks, inbox, schedules, skills
   data/audit.jsonl
-  SOUL.md, MEMORY.md, HEARTBEAT.md
+  SOUL.md
+  MEMORY.md
+  # no HEARTBEAT.md
 ```
-
-Effective tools = skill allowlist ∩ enabled tools ∩ policy. No multi-agent in v1.
 
 ---
 
-## 7. Config (additions)
+## 7. Config
+
+Remove `heartbeat.*`. Add:
 
 ```yaml
-tools:
-  tasks:
-    enabled: true
+scheduler:
+  enabled: true
+  tick: 30s
+  quiet_hours:
+    start: "23:00"
+    end: "07:00"
+    timezone: Local
 
 inbox:
   max_pending_per_session: 20
-  drop: oldest   # oldest | refuse
+  drop: oldest
 
 tasks:
   inject_open_limit: 20
-  run_end_policy: block   # block | cancel for owner=run leftovers
+  run_end_policy: block
   default_requires_approval: false
+
+skills:
+  dir: skills
+  doctor_sync: true
 ```
 
-(Other sections unchanged from v2: model, channels, loop, heartbeat, middleware, skills.)
-
 ---
 
-## 8. Tools (core v1)
+## 8. Tools
 
-workspace_list/read/write, http_fetch, memory_read/write, task_* (when enabled), shell **off** by default. No browser in core.
-
----
-
-## 9–12. Channels, CLI, core/full, model
-
-As v2, plus busy session → inbox; CLI adds `byzclaw task …`; LocalDemo when no API key.
+workspace_*, http_fetch, memory_*, task_*, shell off by default.  
+Skill activation may be a tool later; playbook ensure is runtime, not model-authored SQL.
 
 ---
 
 ## 13. Wiring
 
-```
-parse flags → load config → secrets/store/taskstore/inboxstore/policy
-→ register tools/channels/middleware
-→ Loop → doctor → channels/heartbeat/webhook
-→ inbound: busy? enqueue : Handle
-→ recover incomplete runs → drain pending → SIGINT
+```text
+OpenRuntime → doctor (incl skill sync)
+→ gateway: channels + scheduler tick + inbox drain loop
+→ recover incomplete runs → drain inbox → SIGINT
 ```
 
 ---
 
-## 14. Tests (required)
+## 14. Tests (add)
 
-Path jail, crash resume, max iterations, SSRF, golden tool round-trip, PII,
-**tasks** (create/list/complete; agent cannot complete owner=user; requires_approval flow),
-**inbox** (enqueue while busy; drain; dedupe; no double-deliver after restart),
-**run end** (owner=run policy).
-
----
-
-## 15. Makefile
-
-Unchanged: `CGO_ENABLED=0`, `-ldflags="-s -w"`, no UPX, modernc sqlite.
+- Scheduler mints once per dedupe_key  
+- Due task enqueues inbox once  
+- Task without wake never appears in inbox  
+- Empty inbox → no Handle  
+- Doctor upserts SKILL.md into skills table  
+- No HEARTBEAT path in gateway  
 
 ---
 
 ## 16. Implementation order
 
-**Done (do not regress):** loop, jail, tools, onboard/doctor/run, skills, compaction,
-middleware, gateway, webhook, Telegram, heartbeat, audit.
+**Done:** loop, jail, tools, onboard/doctor/run, file skills (migrate), compaction, middleware, gateway, channels, **legacy heartbeat (to remove)**.
 
-**Next:** tasks + inbox tables/ports → gateway buffer/drain → task tools/CLI →
-inject open tasks → run-end reconcile → optional approval hook → tests → README naming.
-
-**Later:** Discord, browser, full UI, MCP, email, external TaskStore.
-
----
-
-## 17. Demo bar
-
-```
-make build && ./bin/byzclaw onboard
-./bin/byzclaw run --text "write hello to workspace/hi.md"
-```
-
-Plus when tasks/inbox land: create user task, `byzclaw task list`, second message while busy drains after.
+**Next:**
+1. tables: tasks, inbox, schedules, skills  
+2. TaskStore / InboxStore / ScheduleStore / SkillRegistry  
+3. Inbox-only wake + drain in gateway  
+4. Scheduler tick (replace StartHeartbeat)  
+5. Doctor skill sync; skill load from DB  
+6. task tools/CLI; due_at; approval policy  
+7. Remove HEARTBEAT.md from onboard/doctor/config  
+8. Tests + README  
 
 ---
 
 ## 18. Anti-patterns
 
-Prior list, plus:
-- Calling the session pending buffer a "queue" in user-facing docs
-- Storing todos only in HEARTBEAT.md / MEMORY.md
-- Second registered agent engine / pluggable Loop.Handle
-- Approval as a separate database or workflow product
-- Merging inbox notifications with task completion state
-
----
-
-## 19–20. README / not from EnterpriseClaw
-
-Unchanged intent. Later enterprise = adapters on this same core.
+- HEARTBEAT.md or synthetic heartbeat Kind as ongoing design  
+- Scheduler calling the model  
+- Moving task rows into inbox  
+- Every minted task auto-waking the agent  
+- Long skill novels every turn instead of tools + short content  
+- Model inventing playbook side effects  
+- Calling inbox a "queue" in product docs  
+- Second agent engine  
 
 ---
 
 ## 21. Design origins
 
-- **Gears:** SQLite for queryable facts; avoid stuffing the model with large files
-- **OpenClaw:** durability lessons; do not copy RAM/skill-hub/security defaults
-- **PicoClaw:** small binary; HEARTBEAT.md as standing orders only
-- **byz-claw:** fixed loop + hooks; tasks = completion contracts; inbox = pending
+- Gears: SQLite index + optional file bodies  
+- OpenClaw: lessons, not defaults  
+- byz-claw: fixed loop; **scheduler → tasks; inbox → wake; skills registry + tools**  
 
 ---
 
-*End of spec v3. Implement strictly. When ambiguous, choose the stricter security interpretation.*
+*End of spec v4. Implement strictly. When ambiguous, choose the stricter security interpretation.*
