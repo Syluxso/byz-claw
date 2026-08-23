@@ -21,14 +21,17 @@ import (
 // Verbose enables stderr audit lines (BYZCLAW_VERBOSE=1 or --verbose).
 var Verbose bool
 
-
 type Runtime struct {
-	Home   home.Paths
-	Config config.Config
-	Store  *storeadapter.SQLite
-	Loop   *core.Loop
-	Model  ports.Model
-	Skills []ports.Skill
+	Home      home.Paths
+	Config    config.Config
+	Store     *storeadapter.SQLite
+	Tasks     ports.TaskStore
+	Inbox     ports.InboxStore
+	Schedules ports.ScheduleStore
+	SkillsDB  ports.SkillRegistry
+	Loop      *core.Loop
+	Model     ports.Model
+	Skills    []ports.Skill
 }
 
 func OpenRuntime(homeRoot string) (*Runtime, error) {
@@ -44,6 +47,21 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 	st, err := storeadapter.Open(p.DB)
 	if err != nil {
 		return nil, err
+	}
+	tasks := storeadapter.Tasks{DB: st}
+	inbox := storeadapter.Inbox{DB: st}
+	schedules := storeadapter.Schedules{DB: st}
+	skillsDB := storeadapter.Skills{DB: st}
+
+	skillsDir := cfg.Skills.Dir
+	if !filepath.IsAbs(skillsDir) {
+		skillsDir = filepath.Join(p.Root, skillsDir)
+	}
+	if cfg.Skills.DoctorSync {
+		if _, err := core.SyncSkillsDir(context.Background(), skillsDB, skillsDir); err != nil {
+			// non-fatal at open; doctor reports
+			_ = err
+		}
 	}
 
 	wsRoot := cfg.Tools.Workspace.Root
@@ -70,16 +88,19 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 	if cfg.Tools.Shell.Enabled {
 		allTools = append(allTools, &tooladapter.Shell{Policy: wsPolicy})
 	}
-
-	skillsDir := cfg.Skills.Dir
-	if !filepath.IsAbs(skillsDir) {
-		skillsDir = filepath.Join(p.Root, skillsDir)
+	if cfg.Tools.Tasks.Enabled {
+		allTools = append(allTools, (&tooladapter.TaskTools{
+			Store:                   tasks,
+			DefaultRequiresApproval: cfg.Tasks.DefaultRequiresApproval,
+		}).Tools()...)
 	}
-	// Also load bundled example skills from install cwd if home skills empty.
-	skills, _ := core.LoadSkillsDir(skillsDir)
+
+	recs, _ := skillsDB.ListEnabled(context.Background())
+	skills := core.SkillsFromRegistry(recs)
 	if len(skills) == 0 {
-		if bundled, err := core.LoadSkillsDir(filepath.Join(p.Root, "skills")); err == nil {
-			skills = bundled
+		// fallback file load once if DB empty
+		if fileSkills, err := core.LoadSkillsDir(skillsDir); err == nil {
+			skills = fileSkills
 		}
 	}
 
@@ -88,11 +109,18 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 		toolMap[t.Name()] = t
 	}
 	toolMap = core.FilterToolsBySkills(toolMap, skills)
-	// Shell is opt-in via config; keep it even if skills omit it.
 	if cfg.Tools.Shell.Enabled {
 		for _, t := range allTools {
 			if t.Name() == "shell" {
 				toolMap["shell"] = t
+			}
+		}
+	}
+	// Task tools always available when enabled (not filtered out by skills).
+	if cfg.Tools.Tasks.Enabled {
+		for _, t := range allTools {
+			if strings.HasPrefix(t.Name(), "task_") {
+				toolMap[t.Name()] = t
 			}
 		}
 	}
@@ -137,20 +165,16 @@ func OpenRuntime(homeRoot string) (*Runtime, error) {
 	loop := core.NewLoop(st, mdl, tools, wsPolicy, loopCfg)
 	loop.SystemPrompt = buildSystemPrompt(p, skills)
 	loop.Hooks = buildHooks(cfg)
+	loop.Tasks = tasks
+	loop.TaskInjectN = cfg.Tasks.InjectOpenLimit
+	loop.Inbox = inbox
 	configureAudit(p, Verbose || strings.EqualFold(os.Getenv("BYZCLAW_VERBOSE"), "1") || os.Getenv("BYZCLAW_VERBOSE") == "true")
 
-	return &Runtime{Home: p, Config: cfg, Store: st, Loop: loop, Model: mdl, Skills: skills}, nil
-}
-
-func configureAudit(p home.Paths, verbose bool) {
-	path := filepath.Join(p.Data, "audit.jsonl")
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		hooks.ConfigureAudit(nil, verbose)
-		return
-	}
-	// File handle lives for process lifetime; intentional for daemon.
-	hooks.ConfigureAudit(f, verbose)
+	return &Runtime{
+		Home: p, Config: cfg, Store: st,
+		Tasks: tasks, Inbox: inbox, Schedules: schedules, SkillsDB: skillsDB,
+		Loop: loop, Model: mdl, Skills: skills,
+	}, nil
 }
 
 func (r *Runtime) Close() error {
@@ -164,6 +188,7 @@ func buildSystemPrompt(p home.Paths, skills []ports.Skill) string {
 	var b string
 	b += "You are byzclaw, a personal AI assistant with tools. Prefer tools for file and fetch work.\n"
 	b += "Never claim you wrote a file or fetched a URL unless you called the matching tool.\n"
+	b += "Task completion truth is TaskStore only — use task_complete; do not vibe-complete.\n"
 	if raw, err := os.ReadFile(p.Soul); err == nil && len(raw) > 0 {
 		b += "\n# SOUL\n" + string(raw) + "\n"
 	}
@@ -195,4 +220,14 @@ func buildHooks(cfg config.Config) []ports.Hook {
 		out = append(out, hooks.TokenCeiling{Ceiling: cfg.Loop.TokenCeiling})
 	}
 	return out
+}
+
+func configureAudit(p home.Paths, verbose bool) {
+	path := filepath.Join(p.Data, "audit.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		hooks.ConfigureAudit(nil, verbose)
+		return
+	}
+	hooks.ConfigureAudit(f, verbose)
 }

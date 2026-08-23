@@ -7,8 +7,12 @@ import (
 	"runtime"
 	"strings"
 
+	"context"
+
 	"github.com/Syluxso/byzclaw/config"
 	"github.com/Syluxso/byzclaw/internal/adapters/secrets"
+	storeadapter "github.com/Syluxso/byzclaw/internal/adapters/store"
+	"github.com/Syluxso/byzclaw/internal/core"
 	"github.com/Syluxso/byzclaw/internal/home"
 )
 
@@ -110,7 +114,6 @@ func Doctor(homeRoot string) ([]DoctorFinding, error) {
 	for _, f := range []struct{ name, path string }{
 		{"SOUL.md", p.Soul},
 		{"MEMORY.md", p.MemoryMD},
-		{"HEARTBEAT.md", p.Heartbeat},
 	} {
 		fi, err := os.Stat(f.path)
 		if err != nil {
@@ -121,6 +124,31 @@ func Doctor(homeRoot string) ([]DoctorFinding, error) {
 			out = append(out, DoctorFinding{"warn", f.name, "large file; may bloat prompts"})
 		} else {
 			out = append(out, DoctorFinding{"ok", f.name, "present"})
+		}
+	}
+
+	if _, err := os.Stat(p.Heartbeat); err == nil {
+		out = append(out, DoctorFinding{"warn", "HEARTBEAT.md", "present but unused (v4 uses scheduler+tasks)"})
+	}
+
+	if cfg.Scheduler.Enabled {
+		out = append(out, DoctorFinding{"ok", "scheduler", "enabled tick=" + cfg.Scheduler.Tick})
+	} else {
+		out = append(out, DoctorFinding{"warn", "scheduler", "disabled"})
+	}
+
+	if cfg.Skills.DoctorSync {
+		db, err := storeadapter.Open(p.DB)
+		if err != nil {
+			out = append(out, DoctorFinding{"warn", "skills_sync", err.Error()})
+		} else {
+			n, err := core.SyncSkillsDir(context.Background(), storeadapter.Skills{DB: db}, p.Skills)
+			_ = db.Close()
+			if err != nil {
+				out = append(out, DoctorFinding{"warn", "skills_sync", err.Error()})
+			} else {
+				out = append(out, DoctorFinding{"ok", "skills_sync", fmt.Sprintf("upserted %d from skills/", n)})
+			}
 		}
 	}
 

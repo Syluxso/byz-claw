@@ -2,7 +2,7 @@
 
 OpenClaw’s idea. Pico-class install. Defaults that will not burn the host.
 
-One static Go binary. Text it on CLI (Telegram/webhook next). Skills are markdown; tools are reviewed Go. Shell off; workspace jail; `doctor` included.
+One static Go binary. Text it on CLI / Telegram / webhook. Skills are markdown (synced to SQLite); tools are reviewed Go. Shell off; workspace jail; `doctor` included.
 
 **Standalone / open source.** Not `byz-agent`. No Byzantine platform dependency. Future Byz = optional adapters only.
 
@@ -16,6 +16,9 @@ make build
 ./bin/byzclaw doctor
 ./bin/byzclaw gateway          # CLI REPL (+ recover incomplete runs)
 ./bin/byzclaw gateway --webhook  # also listen on webhook (see config)
+./bin/byzclaw task list
+./bin/byzclaw task show --id <id>
+./bin/byzclaw task complete --id <id>
 ./bin/byzclaw run --text "..." --verbose  # audit JSON on stderr too
 ```
 
@@ -34,6 +37,14 @@ curl -s http://127.0.0.1:8743/hook -H 'Content-Type: application/json' \
   -d '{"session_id":"demo","text":"write hi to workspace/from-hook.md"}'
 ```
 
+### Gateway model (v4)
+
+- **Inbox** is the only wake path for the agent loop.
+- **Scheduler** ticks with **no LLM**: mints tasks from schedules; may enqueue inbox wakes.
+- **Tasks** define finished work (`task_complete` tool / `byzclaw task complete`).
+- Busy session → new inbound is **enqueued**, not parallel-handled.
+- **HEARTBEAT.md** runtime removed (leftover file = doctor warn only).
+
 ## Spec & design pattern
 
 - **Concrete plan (v4):** [`BYZCLAW_BUILD_PLAN.md`](./BYZCLAW_BUILD_PLAN.md) — schedules → tasks; inbox → wake; skills DB registry  
@@ -41,8 +52,9 @@ curl -s http://127.0.0.1:8743/hook -H 'Content-Type: application/json' \
 
 ## Status
 
-Core loop, store, jail, tools, onboard/doctor/run, skills (file → migrate to DB), compaction, middleware, gateway, webhook, and Telegram are in.  
-**Next (v4):** tasks + inbox + schedules + skills registry; **remove** HEARTBEAT runtime.
+**Plan v4 §16 complete:** SQLite tasks/inbox/schedules/skills, inbox-only wake + drain, scheduler tick, doctor skill sync, task tools/CLI, HEARTBEAT runtime removed.
+
+Still later (out of §16): Discord, browser automation, MCP — when needed.
 
 Enable Telegram in `config.yaml` (`channels.telegram.enabled`, `allow_from: ["your_chat_id"]`) and `secrets/telegram_bot`.
 

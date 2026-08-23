@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -21,9 +22,20 @@ type Loop struct {
 	Config       LoopConfig
 	Channel      ports.Channel // optional outbound
 	SystemPrompt string
+	Tasks        ports.TaskStore
+	TaskInjectN  int
+	Inbox        ports.InboxStore
+	InboxItemID  string // set when handling a drained inbox item
 
 	mu     sync.Mutex
 	active map[string]bool // sessionID → running
+}
+
+// IsBusy reports whether a session currently has an active Handle.
+func (l *Loop) IsBusy(sessionID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.active[sessionID]
 }
 
 func NewLoop(store ports.Store, model ports.Model, tools []ports.Tool, policy ports.Policy, cfg LoopConfig) *Loop {
@@ -133,10 +145,14 @@ func (l *Loop) continueRun(
 		}
 		msgs, _ = l.CompactIfNeeded(ctx, in.SessionID, msgs)
 
+		sys := l.SystemPrompt
+		if inj := l.openTasksJSON(ctx); inj != "" {
+			sys += "\n# Open tasks\n" + inj + "\n"
+		}
 		prompt := msgs
-		if l.SystemPrompt != "" {
+		if sys != "" {
 			prompt = append([]ports.Message{{
-				Role: "system", Content: l.SystemPrompt, CreatedAt: l.Clock.Now(),
+				Role: "system", Content: sys, CreatedAt: l.Clock.Now(),
 			}}, msgs...)
 		}
 		if err := l.runHooks(ctx, ports.HookBeforeModel, hc); err != nil {
@@ -172,6 +188,9 @@ func (l *Loop) continueRun(
 			run.Status = ports.RunCompleted
 			run.UpdatedAt = l.Clock.Now()
 			_ = l.Store.SaveRun(ctx, *run)
+			if l.Inbox != nil && l.InboxItemID != "" {
+				_ = l.Inbox.MarkDelivered(ctx, l.InboxItemID, run.ID)
+			}
 			_ = l.runHooks(ctx, ports.HookOnComplete, hc)
 			out := ports.Outbound{Channel: in.Channel, SessionID: in.SessionID, Text: resp.Content}
 			if l.Channel != nil {
@@ -377,6 +396,35 @@ func missingToolCalls(msgs []ports.Message) (asst *ports.Message, missing []port
 		}
 	}
 	return last, missing
+}
+
+func (l *Loop) openTasksJSON(ctx context.Context) string {
+	if l.Tasks == nil {
+		return ""
+	}
+	limit := l.TaskInjectN
+	if limit <= 0 {
+		limit = 20
+	}
+	list, err := l.Tasks.List(ctx, ports.TaskFilter{Status: ports.TaskOpen, Limit: limit})
+	if err != nil || len(list) == 0 {
+		return ""
+	}
+	type row struct {
+		ID, Owner, Title, Status, DoneWhen string
+	}
+	rows := make([]row, 0, len(list))
+	for _, t := range list {
+		rows = append(rows, row{
+			ID: t.ID, Owner: string(t.Owner), Title: t.Title,
+			Status: string(t.Status), DoneWhen: t.DoneWhen,
+		})
+	}
+	b, err := json.Marshal(rows)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func newID() string {

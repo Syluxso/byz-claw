@@ -11,7 +11,7 @@ type Inbound struct {
 	SessionID string
 	UserID    string
 	Text      string
-	Kind      string // "user" | "heartbeat" | "system"
+	Kind      string // "user" | "system" | "task_wake"
 	Meta      map[string]string
 }
 

@@ -299,9 +299,9 @@ OpenRuntime → doctor (incl skill sync)
 
 ## 16. Implementation order
 
-**Done:** loop, jail, tools, onboard/doctor/run, file skills (migrate), compaction, middleware, gateway, channels, **legacy heartbeat (to remove)**.
+**Done:** loop, jail, tools, onboard/doctor/run, file skills (migrate), compaction, middleware, gateway, channels, **and §16 items 1–8 below**.
 
-**Next:**
+**§16 (landed):**
 1. tables: tasks, inbox, schedules, skills  
 2. TaskStore / InboxStore / ScheduleStore / SkillRegistry  
 3. Inbox-only wake + drain in gateway  

@@ -2,13 +2,15 @@ package config
 
 import "time"
 
-// Config is the on-disk YAML schema (plan §7).
+// Config is the on-disk YAML schema (plan v4).
 type Config struct {
 	Model      ModelConfig      `yaml:"model"`
 	Channels   ChannelsConfig   `yaml:"channels"`
 	Tools      ToolsConfig      `yaml:"tools"`
 	Loop       LoopConfig       `yaml:"loop"`
-	Heartbeat  HeartbeatConfig  `yaml:"heartbeat"`
+	Scheduler  SchedulerConfig  `yaml:"scheduler"`
+	Inbox      InboxConfig      `yaml:"inbox"`
+	Tasks      TasksConfig      `yaml:"tasks"`
 	Middleware []string         `yaml:"middleware"`
 	Skills     SkillsConfig     `yaml:"skills"`
 }
@@ -41,13 +43,13 @@ type ChannelWebhook struct {
 	Addr        string `yaml:"addr"`
 	Path        string `yaml:"path"`
 	AllowPublic bool   `yaml:"allow_public"`
-	// Token is loaded from secrets/webhook_token when present (not stored in YAML).
 }
 
 type ToolsConfig struct {
 	Workspace WorkspaceToolConfig `yaml:"workspace"`
 	HTTPFetch HTTPFetchConfig     `yaml:"http_fetch"`
 	Shell     ShellConfig         `yaml:"shell"`
+	Tasks     ToolTasksConfig     `yaml:"tasks"`
 }
 
 type WorkspaceToolConfig struct {
@@ -63,6 +65,10 @@ type ShellConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+type ToolTasksConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 type LoopConfig struct {
 	MaxToolIterations     int    `yaml:"max_tool_iterations"`
 	CompactTokenThreshold int    `yaml:"compact_token_threshold"`
@@ -71,11 +77,10 @@ type LoopConfig struct {
 	TokenCeiling          int    `yaml:"token_ceiling"`
 }
 
-type HeartbeatConfig struct {
-	Enabled    bool              `yaml:"enabled"`
-	Interval   string            `yaml:"interval"`
-	QuietHours QuietHoursConfig  `yaml:"quiet_hours"`
-	Model      string            `yaml:"model"`
+type SchedulerConfig struct {
+	Enabled    bool             `yaml:"enabled"`
+	Tick       string           `yaml:"tick"`
+	QuietHours QuietHoursConfig `yaml:"quiet_hours"`
 }
 
 type QuietHoursConfig struct {
@@ -84,8 +89,20 @@ type QuietHoursConfig struct {
 	Timezone string `yaml:"timezone"`
 }
 
+type InboxConfig struct {
+	MaxPendingPerSession int    `yaml:"max_pending_per_session"`
+	Drop                 string `yaml:"drop"` // oldest | refuse
+}
+
+type TasksConfig struct {
+	InjectOpenLimit         int    `yaml:"inject_open_limit"`
+	RunEndPolicy            string `yaml:"run_end_policy"` // block | cancel
+	DefaultRequiresApproval bool   `yaml:"default_requires_approval"`
+}
+
 type SkillsConfig struct {
-	Dir string `yaml:"dir"`
+	Dir         string `yaml:"dir"`
+	DoctorSync  bool   `yaml:"doctor_sync"`
 }
 
 func Default() Config {
@@ -105,6 +122,7 @@ func Default() Config {
 			Workspace: WorkspaceToolConfig{Root: "workspace"},
 			HTTPFetch: HTTPFetchConfig{MaxBytes: 2_000_000, TimeoutSeconds: 30},
 			Shell:     ShellConfig{Enabled: false},
+			Tasks:     ToolTasksConfig{Enabled: true},
 		},
 		Loop: LoopConfig{
 			MaxToolIterations:     12,
@@ -113,21 +131,23 @@ func Default() Config {
 			Profile:               "interactive",
 			TokenCeiling:          0,
 		},
-		Heartbeat: HeartbeatConfig{
-			Enabled:  false,
-			Interval: "1h",
+		Scheduler: SchedulerConfig{
+			Enabled: true,
+			Tick:    "30s",
 			QuietHours: QuietHoursConfig{
 				Start: "23:00", End: "07:00", Timezone: "Local",
 			},
 		},
+		Inbox: InboxConfig{MaxPendingPerSession: 20, Drop: "oldest"},
+		Tasks: TasksConfig{InjectOpenLimit: 20, RunEndPolicy: "block", DefaultRequiresApproval: false},
 		Middleware: []string{"audit", "pii", "token_ceiling"},
-		Skills:     SkillsConfig{Dir: "skills"},
+		Skills:     SkillsConfig{Dir: "skills", DoctorSync: true},
 	}
 }
 
-func (c Config) HeartbeatInterval() (time.Duration, error) {
-	if c.Heartbeat.Interval == "" {
-		return time.Hour, nil
+func (c Config) SchedulerTick() (time.Duration, error) {
+	if c.Scheduler.Tick == "" {
+		return 30 * time.Second, nil
 	}
-	return time.ParseDuration(c.Heartbeat.Interval)
+	return time.ParseDuration(c.Scheduler.Tick)
 }

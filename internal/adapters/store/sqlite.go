@@ -38,32 +38,6 @@ func (s *SQLite) Close() error {
 	return s.db.Close()
 }
 
-func (s *SQLite) migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT NOT NULL DEFAULT '',
-  tool_calls_json TEXT NOT NULL DEFAULT '[]',
-  tool_call_id TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
-
-CREATE TABLE IF NOT EXISTS runs (
-  id TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  iteration INTEGER NOT NULL DEFAULT 0,
-  error TEXT NOT NULL DEFAULT '',
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_runs_incomplete ON runs(status);
-`)
-	return err
-}
-
 func (s *SQLite) SaveMessage(ctx context.Context, m ports.Message) error {
 	if m.ID == "" {
 		return fmt.Errorf("message id required")

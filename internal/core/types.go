@@ -6,7 +6,7 @@ type LoopConfig struct {
 	CompactTokenThreshold int
 	CompactTailMessages   int
 	TokenCeiling          int
-	Profile               string // interactive | heartbeat
+	Profile               string // interactive (legacy "heartbeat" ignored)
 }
 
 func DefaultLoopConfig() LoopConfig {

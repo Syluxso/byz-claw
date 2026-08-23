@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -69,11 +70,7 @@ func main() {
 		defer rt.Close()
 		_ = rt.Loop.RecoverIncomplete(context.Background())
 		out, err := rt.Loop.Handle(context.Background(), ports.Inbound{
-			Channel:   "cli",
-			SessionID: *session,
-			UserID:    "local",
-			Text:      *text,
-			Kind:      "user",
+			Channel: "cli", SessionID: *session, UserID: "local", Text: *text, Kind: "user",
 		})
 		must(err)
 		fmt.Println(out.Text)
@@ -89,15 +86,74 @@ func main() {
 		root, err := home.Resolve(*homeFlag)
 		must(err)
 		must(app.RunGateway(root, app.GatewayOptions{
-			CLI:      !*noCLI,
-			Webhook:  *webhook,
-			Telegram: *telegram,
+			CLI: !*noCLI, Webhook: *webhook, Telegram: *telegram,
 		}))
+	case "task":
+		must(runTask(args))
 	default:
 		fmt.Fprintf(os.Stderr, "byzclaw: unknown command %q\n", cmd)
 		printHelp()
 		os.Exit(2)
 	}
+}
+
+func runTask(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: byzclaw task list|show|complete [--home DIR] ...")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("task", flag.ExitOnError)
+	homeFlag := fs.String("home", "", "BYZCLAW_HOME")
+	id := fs.String("id", "", "task id")
+	_ = fs.Parse(args[1:])
+	root, err := home.Resolve(*homeFlag)
+	if err != nil {
+		return err
+	}
+	rt, err := app.OpenRuntime(root)
+	if err != nil {
+		return err
+	}
+	defer rt.Close()
+	ctx := context.Background()
+	switch sub {
+	case "list":
+		list, err := rt.Tasks.List(ctx, ports.TaskFilter{Limit: 50})
+		if err != nil {
+			return err
+		}
+		b, _ := json.MarshalIndent(list, "", "  ")
+		fmt.Println(string(b))
+	case "show":
+		if *id == "" {
+			return fmt.Errorf("task show requires --id")
+		}
+		t, err := rt.Tasks.Get(ctx, *id)
+		if err != nil {
+			return err
+		}
+		b, _ := json.MarshalIndent(t, "", "  ")
+		fmt.Println(string(b))
+	case "complete":
+		if *id == "" {
+			return fmt.Errorf("task complete requires --id")
+		}
+		t, err := rt.Tasks.Get(ctx, *id)
+		if err != nil {
+			return err
+		}
+		// CLI can complete user tasks (human gate).
+		if err := rt.Tasks.Complete(ctx, t.ID); err != nil {
+			return err
+		}
+		if t.Kind == "approval" && t.ParentID != "" {
+			_ = rt.Tasks.Complete(ctx, t.ParentID)
+		}
+		fmt.Println("completed", t.ID)
+	default:
+		return fmt.Errorf("unknown task subcommand %q", sub)
+	}
+	return nil
 }
 
 func must(err error) {
@@ -108,25 +164,19 @@ func must(err error) {
 }
 
 func printHelp() {
-	fmt.Fprintf(os.Stderr, `byzclaw — personal AI claw
+	fmt.Fprintf(os.Stderr, `byzclaw — personal AI claw (plan v4)
 
 Usage:
   byzclaw onboard [--home DIR] [--yes]
   byzclaw doctor  [--home DIR]
-  byzclaw run --text "..." [--home DIR] [--session ID]
-  byzclaw gateway [--home DIR] [--no-cli] [--webhook] [--telegram]
+  byzclaw run --text "..." [--home DIR] [--session ID] [--verbose]
+  byzclaw gateway [--home DIR] [--no-cli] [--webhook] [--telegram] [--verbose]
+  byzclaw task list|show|complete [--home DIR] [--id ID]
   byzclaw version
-  byzclaw help
 
-Environment:
-  BYZCLAW_HOME   default ~/.byzclaw
-  XAI_API_KEY / OPENAI_API_KEY  optional if secrets/<api_key_secret> missing
+Design: docs/CODE_FIRST_LLM_LAST.md (wins over "more prompt")
+Plan:   BYZCLAW_BUILD_PLAN.md
 
-Gateway:
-  Starts doctor, recovers incomplete runs, then serves channels.
-  CLI REPL is on by default. Enable webhook/telegram in config.yaml or pass flags.
-  Telegram requires secrets/<token_secret> and non-empty allow_from.
-  Public webhook binds require allow_public + secrets/webhook_token.
-  Heartbeat (config.heartbeat.enabled) injects HEARTBEAT.md on an interval.
+Gateway wakes only from inbox; scheduler mints tasks (no LLM).
 `)
 }

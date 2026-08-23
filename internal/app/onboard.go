@@ -33,8 +33,7 @@ func Onboard(homeRoot string, interactive bool) error {
 
 	writeIfMissing(p.Soul, "# Soul\n\nYou are a helpful personal assistant running as byzclaw.\n")
 	writeIfMissing(p.MemoryMD, "# Memory\n\nLong-term notes live here and under memory/.\n")
-	writeIfMissing(p.Heartbeat, "# Heartbeat\n\nInstructions for periodic heartbeat runs.\n")
-	// Seed example skill if skills dir empty.
+	// HEARTBEAT.md removed in plan v4 (scheduler + tasks replace it).
 	seedExampleSkill(p.Skills)
 
 	sec := &secrets.FileSecrets{Dir: p.Secrets}
