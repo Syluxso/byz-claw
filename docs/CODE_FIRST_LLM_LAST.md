@@ -73,3 +73,7 @@ If a feature can be a state machine + tool, implement that first.
 - Synthetic heartbeat as a second personality path  
 - Scheduler invoking `Complete` / chat  
 - Task row moved into inbox  
+- Every minted task auto-waking the agent  
+- Prompt-only features with no table or tool  
+- Second pluggable `Agent.Execute` engine  
+- The model said “done” without `TaskStore.Complete`  
