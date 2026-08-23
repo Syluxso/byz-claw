@@ -67,3 +67,9 @@ If a feature can be a state machine + tool, implement that first.
 - **Playbook (JSON):** runtime applies deterministically (schedules/tasks/inbox/artifacts).  
 - **Skill content / md:** short guidance only.  
 - Doctor syncs git `SKILL.md` → skills registry; **registry is runtime truth after sync.**
+
+## Anti-patterns (reject in review)
+
+- Synthetic heartbeat as a second personality path  
+- Scheduler invoking `Complete` / chat  
+- Task row moved into inbox  
